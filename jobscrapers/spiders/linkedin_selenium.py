@@ -1,13 +1,3 @@
-"""
-linkedin_selenium.py — Supabase (PostgreSQL) version
-=====================================================
-THAY ĐỔI SO VỚI MySQL:
-  [1] import psycopg2 thay mysql.connector (qua pipelines)
-  [2] ensure_db_connection: reassign (cur, conn) vì psycopg2 không có .ping()
-  [3] Query seen_urls: DATE_SUB(NOW(), INTERVAL 30 DAY)
-      → NOW() - INTERVAL '30 days'  (PostgreSQL syntax)
-  [4] Tất cả logic scrape giữ nguyên 100%
-"""
 
 import time
 import os
@@ -45,7 +35,7 @@ if unknown and unknown[0] in ["daily", "full"]:
     args.mode = unknown[0]
 
 # ===== CONFIG =====
-MAX_JOBS_PER_KEYWORD = 1
+MAX_JOBS_PER_KEYWORD = 10
 JOB_DETAIL_WAIT      = 12
 MIN_ABOUT_JOB_CHARS  = 200
 DAILY_MAX_AGE_DAYS   = 3
