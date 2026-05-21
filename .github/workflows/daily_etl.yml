@@ -1,19 +1,5 @@
 # ==============================================================================
 # .github/workflows/daily_etl.yml
-# Thay thế hoàn toàn run.bat + Windows Task Scheduler
-#
-# LUỒNG CHẠY (giống run.bat):
-#   Step 1 — LinkedIn Selenium  ← BỎ QUA (cần GUI browser, không chạy được trên CI)
-#   Step 2 — Scrapy spiders     ← CHẠY (headless Playwright OK trên Ubuntu)
-#   Step 3 — ETL transform      ← CHẠY
-#   Step 4 — Load DW            ← CHẠY (tích hợp trong etl_supabase.py)
-#
-# SECRETS cần thêm vào GitHub repo → Settings → Secrets and variables → Actions:
-#   DATABASE_URL          postgresql+psycopg2://postgres:[PASS]@db.[REF].supabase.co:5432/postgres
-#   GROQ_API_KEY          gsk_...
-#   LINKEDIN_USERNAME     (dùng cho chạy local, không dùng trên CI)
-#   LINKEDIN_PASSWORD     (dùng cho chạy local, không dùng trên CI)
-#   SCRAPEOPS_API_KEY     53cd5666-...
 # ==============================================================================
 
 name: Daily ETL Pipeline
@@ -23,7 +9,6 @@ on:
     # Chạy lúc 8:00 SA giờ Việt Nam (UTC+7) = 01:00 UTC
     - cron: "0 1 * * *"
 
-  # Cho phép chạy thủ công từ GitHub UI
   workflow_dispatch:
     inputs:
       mode:
@@ -39,7 +24,7 @@ env:
   DATABASE_URL:      ${{ secrets.DATABASE_URL }}
   GROQ_API_KEY:      ${{ secrets.GROQ_API_KEY }}
   SCRAPEOPS_API_KEY: ${{ secrets.SCRAPEOPS_API_KEY }}
-  TYPESENSE_ENABLED: "false"   # Typesense chạy localhost — không dùng được trên CI
+  TYPESENSE_ENABLED: "false"
   PYTHONIOENCODING:  "utf-8"
   MODE: ${{ github.event.inputs.mode || 'daily' }}
 
@@ -47,7 +32,7 @@ jobs:
   etl:
     name: Run ETL Pipeline
     runs-on: ubuntu-latest
-    timeout-minutes: 120   # tối đa 2 tiếng
+    timeout-minutes: 120
 
     steps:
       # ------------------------------------------------------------------
@@ -74,29 +59,30 @@ jobs:
           pip install -r requirements.txt
 
       # ------------------------------------------------------------------
-      # 4. Install Playwright browsers (Chromium cho Scrapy-Playwright)
+      # 4. Install Playwright browsers
+      # FIX BUG 6: thêm sudo cho install-deps (Ubuntu CI yêu cầu)
       # ------------------------------------------------------------------
       - name: Install Playwright Chromium
         run: |
           playwright install chromium
-          playwright install-deps chromium
+          sudo playwright install-deps chromium
 
       # ------------------------------------------------------------------
       # 5. Chạy Scrapy spiders
-      #    - Các spider dùng Playwright/HTTP đều chạy được trên Ubuntu
-      #    - linkedin_selenium.py KHÔNG chạy ở đây (cần undetected-chromedriver + GUI)
+      # FIX BUG 5: bỏ "cd jobscrapers" — chạy từ root để get_project_settings()
+      #            tìm thấy scrapy.cfg ở root
       # ------------------------------------------------------------------
       - name: Run Scrapy spiders
         run: |
           echo "=========================================="
           echo " [2/3] Scrapy spiders | mode=$MODE"
           echo "=========================================="
-          cd jobscrapers
-          python ../run_spiders.py $MODE
-        continue-on-error: true   # spider lỗi không block ETL
+          python run_spiders.py $MODE
+        continue-on-error: true
 
       # ------------------------------------------------------------------
-      # 6. Chạy ETL (transform + dedup + load DW)
+      # 6. Chạy ETL
+      # FIX BUG 2: đường dẫn đúng là etl/etl_supabase.py
       # ------------------------------------------------------------------
       - name: Run ETL
         run: |
@@ -104,16 +90,15 @@ jobs:
           echo " [3/3] ETL transform + Load DW | mode=$MODE"
           echo "=========================================="
           if [ "$MODE" = "full" ]; then
-            python jobscrapers/etl_supabase.py --all
+            python etl/etl_supabase.py --all
           else
-            python jobscrapers/etl_supabase.py
+            python etl/etl_supabase.py
           fi
 
       # ------------------------------------------------------------------
-      # 7. Notify on failure (optional — xóa nếu không dùng)
+      # 7. Notify on failure
       # ------------------------------------------------------------------
       - name: Notify on failure
         if: failure()
         run: |
           echo "❌ Pipeline FAILED — kiểm tra logs ở tab Actions"
-          # Thêm webhook Slack/email ở đây nếu muốn

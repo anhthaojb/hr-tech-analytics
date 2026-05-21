@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 import sqlalchemy
 import os
+import sys
  
 # Typesense chỉ import khi được bật
 TYPESENSE_ENABLED: bool = os.environ.get("TYPESENSE_ENABLED", "true").lower() == "true"
@@ -56,32 +57,16 @@ from lookups import (
     WORK_TYPE_MAP, WORK_MODE_MAP,
     ROLE_WORDS, TECH_DOMAIN, ROLE_DOMAIN_TO_TITLE,
 )
- 
 
-# ==============================================================================
-# 0. CONFIG  [THAY ĐỔI 1 — Supabase PostgreSQL]
-# ==============================================================================
-
-import os
-
-# ── Supabase connection ───────────────────────────────────────────────────────
-# Đặt trong biến môi trường DATABASE_URL hoặc sửa trực tiếp fallback bên dưới.
-# Format:  postgresql+psycopg2://postgres:[PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres
-# Pooler:  postgresql+psycopg2://postgres.[PROJECT-REF]:[PASSWORD]@aws-0-[REGION].pooler.supabase.com:6543/postgres
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "postgresql+psycopg2://postgres:[YOUR_PASSWORD]@db.[YOUR_PROJECT_REF].supabase.co:5432/postgres"
 )
-
+ 
 SRC_TABLE   = "jobs"
 FACT_TABLE  = "fact_jobs_etl"
 LOG_TABLE   = "fact_etl_log"
 ERROR_TABLE = "fact_etl_error"
-
-# ── Typesense ─────────────────────────────────────────────────────────────────
-# Đặt TYPESENSE_ENABLED=false khi chạy trên GitHub Actions
-# (không thể kết nối localhost từ cloud runner)
-TYPESENSE_ENABLED: bool = os.environ.get("TYPESENSE_ENABLED", "true").lower() == "true"
 
 TS_CONFIG = {
     "host":    os.environ.get("TYPESENSE_HOST",    "localhost"),
@@ -89,6 +74,7 @@ TS_CONFIG = {
     "api_key": os.environ.get("TYPESENSE_API_KEY", "changeme123"),
     "timeout": 3,
 }
+ 
 
 # ==============================================================================
 # 0.5 MODULE-LEVEL CONSTANTS  [THAY ĐỔI 6 — boolean cols cần True/False]
@@ -1509,65 +1495,64 @@ class RecruitmentETL:
     # RUN  [THAY ĐỔI 9 — tích hợp _load_dwh vào run()]
     # --------------------------------------------------------------------------
 
-def run(self, mode: str = "today", date_str: str | None = None):
-        print(f"\n{'=' * 62}")
-        print(f"  ETL START [{datetime.now():%Y-%m-%d %H:%M:%S}]  mode={mode}")
-        print(f"{'=' * 62}")
- 
-        print("\n⏳ [1/5] Load...")
-        df_raw, target_date = self._load(mode, date_str)
-        if df_raw.empty:
-            print("   Không có dữ liệu.")
-            return None
- 
-        run_id = self._start_log(mode, target_date)
-        print(f"   run_id={run_id}")
- 
-        counts = {"input": len(df_raw), "output": 0,
-                  "new": 0, "updated": 0, "errors": 0}
-        status = "SUCCESS"
- 
-        try:
-            print("\n⏳ [2/5] Transform...")
-            df_clean, ec     = self._transform(df_raw, run_id)
-            counts["output"] = len(df_clean)
-            counts["errors"] = len(ec)
- 
-            print("\n⏳ [3/5] Save fact...")
-            saved             = self._save_fact(df_clean)
-            counts["new"]     = saved["new"]
-            counts["updated"] = saved["updated"]
- 
-            print("\n⏳ [3.5/5] Match company...")
-            self._match_and_update_companies(run_id)  # FIX B2: tự skip nếu tắt
- 
-            print("\n⏳ [3.8/5] Dedup & flag...")
-            dedup           = self._dedup_and_flag(run_id)
-            counts["dupes"] = dedup["flagged"]
- 
-            print("\n⏳ [4/5] Save errors...")
-            self._save_errors(ec, run_id)
- 
-            print("\n⏳ [5/5] Load Data Warehouse...")
-            self._load_dwh(mode, date_str)
- 
-            if counts["input"] > 0 and counts["errors"] / counts["input"] > 0.2:
-                status = "WARN"
- 
-        except Exception as e:
-            status = "FAILED"
-            self._finish_log(run_id, counts, status, str(e))
-            print(f"\n✗ FAILED: {e}")
-            raise
- 
-        self._finish_log(run_id, counts, status)
-        print(f"\n{'=' * 62}")
-        print(f"  DONE [{datetime.now():%Y-%m-%d %H:%M:%S}] {status}")
-        print(f"  input={counts['input']} out={counts['output']} "
-              f"new={counts['new']} upd={counts['updated']} err={counts['errors']}")
-        print(f"{'=' * 62}\n")
-        return df_clean
- 
+    def run(self, mode: str = "today", date_str: str | None = None):
+            print(f"\n{'=' * 62}")
+            print(f"  ETL START [{datetime.now():%Y-%m-%d %H:%M:%S}]  mode={mode}")
+            print(f"{'=' * 62}")
+    
+            print("\n⏳ [1/5] Load...")
+            df_raw, target_date = self._load(mode, date_str)
+            if df_raw.empty:
+                print("   Không có dữ liệu.")
+                return None
+    
+            run_id = self._start_log(mode, target_date)
+            print(f"   run_id={run_id}")
+    
+            counts = {"input": len(df_raw), "output": 0,
+                    "new": 0, "updated": 0, "errors": 0}
+            status = "SUCCESS"
+    
+            try:
+                print("\n⏳ [2/5] Transform...")
+                df_clean, ec     = self._transform(df_raw, run_id)
+                counts["output"] = len(df_clean)
+                counts["errors"] = len(ec)
+    
+                print("\n⏳ [3/5] Save fact...")
+                saved             = self._save_fact(df_clean)
+                counts["new"]     = saved["new"]
+                counts["updated"] = saved["updated"]
+    
+                print("\n⏳ [3.5/5] Match company...")
+                self._match_and_update_companies(run_id)
+    
+                print("\n⏳ [3.8/5] Dedup & flag...")
+                dedup           = self._dedup_and_flag(run_id)
+                counts["dupes"] = dedup["flagged"]
+    
+                print("\n⏳ [4/5] Save errors...")
+                self._save_errors(ec, run_id)
+    
+                print("\n⏳ [5/5] Load Data Warehouse...")
+                self._load_dwh(mode, date_str)
+    
+                if counts["input"] > 0 and counts["errors"] / counts["input"] > 0.2:
+                    status = "WARN"
+    
+            except Exception as e:
+                status = "FAILED"
+                self._finish_log(run_id, counts, status, str(e))
+                print(f"\n✗ FAILED: {e}")
+                raise
+    
+            self._finish_log(run_id, counts, status)
+            print(f"\n{'=' * 62}")
+            print(f"  DONE [{datetime.now():%Y-%m-%d %H:%M:%S}] {status}")
+            print(f"  input={counts['input']} out={counts['output']} "
+                f"new={counts['new']} upd={counts['updated']} err={counts['errors']}")
+            print(f"{'=' * 62}\n")
+            return df_clean
 # ==============================================================================
 # 5. CLI
 # ==============================================================================
