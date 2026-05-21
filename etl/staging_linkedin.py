@@ -6,6 +6,8 @@ import time
 import logging
 import psycopg2
 from groq import Groq
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from jobscrapers.pipelines import get_db_connection, _clean_nbsp
 
 logger = logging.getLogger(__name__)
