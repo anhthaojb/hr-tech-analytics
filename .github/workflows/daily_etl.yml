@@ -93,7 +93,7 @@ jobs:
           echo "=========================================="
           echo " [2/3] Scrapy spiders | mode=$MODE"
           echo "=========================================="
-          python ../run_spiders.py $MODE
+          python run_spiders.py $MODE
         continue-on-error: true   # spider lỗi không block ETL
       - name: Run AI processor (LinkedIn)
         env:
