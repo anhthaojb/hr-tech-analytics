@@ -98,6 +98,7 @@ jobs:
         continue-on-error: true   # spider lỗi không block ETL
       - name: Run AI processor (LinkedIn)
         env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python staging_linkedin.py
