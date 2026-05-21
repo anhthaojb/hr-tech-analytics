@@ -24,3 +24,4 @@ pipeline_*.log
 .idea/
 *.swp
 *.sql
+ai_processor.py

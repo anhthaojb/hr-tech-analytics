@@ -13,12 +13,12 @@ def main():
 
     SPIDERS = [
         "topcv",
-        "careerlink",
-        "careerviet",
-        "joboko",
-         "jobsgo",
-        "timviec365",
-        "vieclam24h",
+        # "careerlink",
+        # "careerviet",
+        # "joboko",
+        #  "jobsgo",
+        # "timviec365",
+        # "vieclam24h",
         "vietnamwork",
         "itviec"
     ]
