@@ -78,8 +78,7 @@ jobs:
       # ------------------------------------------------------------------
       - name: Install Playwright Chromium
         run: |
-          playwright install chromium
-          playwright -m install-deps chromium
+          playwright install chromium --with-deps
 
       # ------------------------------------------------------------------
       # 5. Chạy Scrapy spiders
