@@ -33,3 +33,4 @@ typesense>=0.21.0
 itemadapter>=0.9.0
 scrapeops-scrapy>=0.5.4         # fake user agent
 setuptools
+beautifulsoup4
