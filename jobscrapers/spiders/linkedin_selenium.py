@@ -37,17 +37,6 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 from jobscrapers.pipelines import RunTracker, clean_dict, save_to_db, get_db_connection
-
-try:
-    if not os.getenv("GROQ_API_KEY"):
-        raise ValueError("GROQ_API_KEY không có trong .env")
-    from ai_processor import process_linkedin_item
-    AI_ENABLED = True
-    print("✅ AI processor loaded")
-except Exception as e:
-    AI_ENABLED = False
-    print(f"⚠️  ai_processor disabled: {e}")
-
 # ===== CLI =====
 parser = argparse.ArgumentParser()
 parser.add_argument("--mode", default="daily", choices=["daily", "full"])
@@ -62,18 +51,18 @@ MIN_ABOUT_JOB_CHARS  = 200
 DAILY_MAX_AGE_DAYS   = 3
 
 KEYWORDS_BY_CATEGORY = {
-    "software_dev": [
-        "software engineer",
-        "backend developer",
-        "frontend developer",
-        "full stack developer",
-    ],
-    "data": [
-        "data analyst",
-        "data scientist",
-        "data engineer",
-        "business intelligence",
-    ],
+    # "software_dev": [
+    #     "software engineer",
+    #     "backend developer",
+    #     "frontend developer",
+    #     "full stack developer",
+    # ],
+    # "data": [
+    #     "data analyst",
+    #     "data scientist",
+    #     "data engineer",
+    #     "business intelligence",
+    # ],
     "devops_cloud": [
         "devops engineer",
         "cloud engineer",
@@ -213,24 +202,6 @@ def _is_old_linkedin(posted_text: str) -> bool:
         "month": n * 30, "year": n * 365,
     }.get(unit, 0)
     return age_days > DAILY_MAX_AGE_DAYS
-
-
-def _enrich_with_ai(item: dict) -> dict:
-    if not AI_ENABLED:
-        item["job_description"] = item.get("raw_about_job")
-        item["job_requirement"] = None
-        return item
-    try:
-        enriched = process_linkedin_item(item)
-        if not enriched.get("job_description"):
-            enriched["job_description"] = item.get("raw_about_job")
-        return enriched
-    except Exception as e:
-        print(f"    ⚠️  AI error: {e} — fallback về raw_about_job")
-        item["job_description"] = item.get("raw_about_job", None)
-        item["job_requirement"] = None
-        return item
-
 
 # =========================================================
 #  Driver + Login
@@ -438,7 +409,10 @@ def parse_job(driver, keyword, category):
         )
         if spans:
             company_size = spans[0].text.strip()
-        raw_info = info_divs[0].text.strip()
+        try:
+            raw_info = info_divs[0].text.strip()
+        except StaleElementReferenceException:
+            raw_info = ""
         for sp in spans:
             raw_info = raw_info.replace(sp.text.strip(), "")
         company_industry = raw_info.strip().strip("·").strip() or None
@@ -596,18 +570,14 @@ def scrape_keyword(driver, keyword, category, seen_urls, cur, conn, mode, tracke
                 break
 
             seen_urls.add(normalized_url)
-            raw["job_url"] = normalized_url
+            raw["job_url"]         = normalized_url
+            raw["job_description"] = None  
+            raw["job_requirement"] = None   
 
-            enriched = _enrich_with_ai(raw)
-            if enriched.get("job_description"):
-                enriched["raw_about_job"] = None
-
-            # [THAY ĐỔI 2] reassign (cur, conn) sau ensure
             cur, conn = ensure_db_connection(cur, conn)
-            cleaned = clean_dict(enriched)
+            cleaned = clean_dict(raw)
             ok, status = save_to_db(cur, conn, cleaned)
             tracker.record(status, cleaned)
-
             if status == "new":
                 count_new += 1
                 print(f"    ✅ MỚI [{count_new}] {cleaned.get('job_title')} @ {cleaned.get('company_title')}")
@@ -718,9 +688,11 @@ def main():
             if cur:  cur.close()
             if conn: conn.close()
         except Exception: pass
-        try:   driver.quit()
-        except Exception: pass
-
+        try:
+            driver.service.process.kill()  # kill process trước
+            driver.quit()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()

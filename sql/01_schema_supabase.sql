@@ -334,3 +334,8 @@ SELECT * FROM fact_jobpostings WHERE is_duplicate = FALSE;
 
 CREATE OR REPLACE VIEW vw_jobpostings_all AS
 SELECT * FROM fact_jobpostings;
+
+
+
+
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ai_processed BOOLEAN DEFAULT FALSE;

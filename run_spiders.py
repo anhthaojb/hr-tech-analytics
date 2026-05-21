@@ -12,14 +12,15 @@ def main():
     process = CrawlerProcess(settings)
 
     SPIDERS = [
-        # "topcv",
-        # # "careerlink",
-        # "careerviet",
-        # "joboko",
-        # #  "jobsgo",
-        # "timviec365",
-        # "vieclam24h",
-        # "vietnamwork",
+        "topcv",
+        "careerlink",
+        "careerviet",
+        "joboko",
+         "jobsgo",
+        "timviec365",
+        "vieclam24h",
+        "vietnamwork",
+        "itviec"
     ]
 
     for spider_name in SPIDERS:

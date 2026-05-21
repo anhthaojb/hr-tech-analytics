@@ -23,3 +23,4 @@ pipeline_*.log
 .vscode/
 .idea/
 *.swp
+*.sql

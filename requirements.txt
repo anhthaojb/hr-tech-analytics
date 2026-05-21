@@ -32,3 +32,4 @@ typesense>=0.21.0
 # ── Scrapy middlewares ────────────────────────────────────────────────────────
 itemadapter>=0.9.0
 scrapeops-scrapy>=0.5.4         # fake user agent
+setuptools

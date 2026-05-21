@@ -19,7 +19,7 @@ import psycopg2.extras
 import re
 import os
 from datetime import datetime, timedelta
-from lookups import (
+from etl.lookups import (
     VW_JOB_TYPE, VW_EDUCATION, VW_JOB_LEVEL, VW_COMPANY_SIZE,
     ITVIEC_WORK_MODE_MAP, ITVIEC_VALID_OUTPUTS, ITVIEC_WORK_MODE_INPUTS,
 )
