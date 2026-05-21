@@ -1,0 +1,25 @@
+# Environment & secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Scrapy
+.scrapy/
+*.log
+
+# Data files
+data/linkedin_cookies.json
+data/
+pipeline_*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp

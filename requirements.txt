@@ -1,0 +1,34 @@
+# ==============================================================================
+# requirements.txt — Recruitment ETL (Supabase/PostgreSQL version)
+# ==============================================================================
+
+# ── Database ──────────────────────────────────────────────────────────────────
+psycopg2-binary>=2.9.9          # PostgreSQL driver cho pipelines.py + linkedin_selenium.py
+sqlalchemy>=2.0.0               # ORM cho etl_supabase.py
+
+# ── Data processing ───────────────────────────────────────────────────────────
+pandas>=2.0.0
+numpy>=1.26.0
+rapidfuzz>=3.6.0                # fuzzy dedup trong etl
+tqdm>=4.66.0
+
+# ── Scrapy + Playwright ───────────────────────────────────────────────────────
+scrapy>=2.11.0
+scrapy-playwright>=0.0.34
+playwright>=1.42.0
+
+# ── Selenium (LinkedIn spider) ────────────────────────────────────────────────
+selenium>=4.18.0
+undetected-chromedriver>=3.5.5
+chromedriver-autoinstaller>=0.6.4
+
+# ── AI (Groq) ─────────────────────────────────────────────────────────────────
+groq>=0.5.0
+python-dotenv>=1.0.0
+
+# ── Typesense (company match) — optional, tắt bằng TYPESENSE_ENABLED=false ───
+typesense>=0.21.0
+
+# ── Scrapy middlewares ────────────────────────────────────────────────────────
+itemadapter>=0.9.0
+scrapeops-scrapy>=0.5.4         # fake user agent

@@ -1,0 +1,202 @@
+import scrapy
+import re
+from scrapy_playwright.page import PageMethod
+from datetime import datetime
+from jobscrapers.items import JobItem
+
+
+class JobsgoSpider(scrapy.Spider):
+    name = "jobsgo"
+    allowed_domains = ["jobsgo.vn"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stopped = False
+
+    def _get_mode(self):
+        return self.crawler.settings.get("CRAWL_MODE", "daily")
+
+    @staticmethod
+    def _is_old(posted_text: str) -> bool:
+        if not posted_text:
+            return False
+        text = posted_text.strip().lower()
+
+        if "hôm nay" in text or "today" in text:
+            return False
+        if "hôm qua" in text or "yesterday" in text:
+            return False  # FIX: hôm qua vẫn còn hợp lệ với daily
+
+        m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", posted_text)
+        if m:
+            try:
+                posted_date = datetime(
+                    int(m.group(3)), int(m.group(2)), int(m.group(1))
+                ).date()
+                return (datetime.now().date() - posted_date).days > 2  # buffer 2 ngày
+            except ValueError:
+                pass
+        return False
+
+    async def start(self):
+        yield scrapy.Request(
+            url="https://jobsgo.vn/viec-lam-cong-nghe-thong-tin.html",
+            meta={
+                "playwright": True,
+                "playwright_page_methods": [
+                    PageMethod("wait_for_selector", "div.job-card", timeout=15000),
+                ],
+                "page_num": 1,
+            },
+            callback=self.parse,
+        )
+
+    def parse(self, response):
+        if self.stopped:
+            return
+
+        jobs = response.css("div.job-card")
+        self.logger.info(f"[jobsgo] {len(jobs)} jobs | {response.url}")
+
+        if not jobs:
+            self.logger.info("[jobsgo] Không còn job — dừng")
+            return
+
+        for job in jobs:
+            job_url = job.css("a.text-decoration-none::attr(href)").get()
+            if not job_url:
+                continue
+
+            yield scrapy.Request(
+                url=job_url,
+                meta={
+                    # FIX: KHÔNG dùng playwright cho detail page
+                    # Jobsgo detail page thường render được bằng HTTP thường
+                    "list_title"    : job.css("h3.job-title::text").get("").strip(),
+                    "list_company"  : job.css("div.company-title::text").get("").strip(),
+                    "list_salary"   : job.css("div.text-primary span:first-child::text").get("").strip(),
+                    "list_location" : job.css("div.text-primary span:last-child::text").get("").strip(),
+                    "list_job_type" : job.css('span[title="Loại hình"]::text').get("").strip(),
+                    "list_experience": job.css('span[title="Yêu cầu kinh nghiệm"]::text').get("").strip(),
+                },
+                callback=self.parse_job_page,
+            )
+
+        if not self.stopped:
+            next_page = response.css("ul.pagination li.next a::attr(href)").get()
+            page_num = response.meta.get("page_num", 1)
+            if next_page and (self._get_mode() == "full" or page_num < 3):
+                yield scrapy.Request(
+                    url=response.urljoin(next_page),
+                    meta={
+                        "playwright": True,
+                        "playwright_page_methods": [
+                            PageMethod("wait_for_selector", "div.job-card", timeout=15000),
+                        ],
+                        "page_num": page_num + 1,
+                    },
+                    callback=self.parse,
+                )
+
+    def parse_job_page(self, response):
+        job_posted_at = response.xpath(
+            "//span[contains(.,'Ngày đăng tuyển')]/following-sibling::strong/text()"
+        ).get("").strip()
+
+        if self._get_mode() == "daily" and self._is_old(job_posted_at):
+            self.logger.info(f"[jobsgo][daily] Job cũ ({job_posted_at!r}) — bỏ qua")
+            return
+
+        item = JobItem()
+        item["website"]         = "jobsgo"
+        item["job_url"]         = response.url
+        item["job_title"]       = (
+            response.css("h1.job-title::text").get("").strip()
+            or response.meta.get("list_title", "")
+        )
+        item["company_title"]   = (
+            response.css("h6.fw-semibold::text").get("").strip()
+            or response.meta.get("list_company", "")
+        )
+        item["compensation"]    = (
+            response.xpath("//span[contains(.,'Mức lương')]/strong/text()").get("").strip()
+            or response.meta.get("list_salary", "")
+        )
+        item["location"]        = (
+            response.xpath("string(//span[contains(.,'Địa điểm')]/strong)").get("").strip()
+            or response.meta.get("list_location", "")
+        )
+        item["experience"]      = (
+            response.xpath("//span[contains(.,'Kinh nghiệm')]/strong/text()").get("").strip()
+            or response.meta.get("list_experience", "")
+        )
+        item["job_type"]        = (
+            response.xpath("//span[contains(.,'Loại hình')]/following-sibling::strong/text()").get("").strip()
+            or response.meta.get("list_job_type", "")
+        )
+        item["education_level"] = response.xpath(
+            "//span[contains(.,'Bằng cấp')]/strong/text()"
+        ).get("").strip()
+        item["job_deadline"]    = response.xpath(
+            "//span[contains(.,'Hạn nộp hồ sơ')]/following-sibling::strong/text()"
+        ).get("").strip()
+        item["job_description"] = " ".join(response.xpath(
+            "//h3[contains(text(),'Mô tả công việc')]/following-sibling::div[1]//text()"
+        ).getall()).strip()
+        item["job_requirement"] = " ".join(response.xpath(
+            "//h3[contains(text(),'Yêu cầu công việc')]/following-sibling::div[1]//text()"
+        ).getall()).strip()
+        item["level"]           = response.xpath(
+            "//span[contains(.,'Cấp bậc')]/following-sibling::strong/text()"
+        ).get("").strip()
+        item["job_posted_at"]   = job_posted_at or None
+        item["job_category"]    = " ".join(response.xpath(
+            "//div[contains(@class,'text-muted') and contains(text(),'Ngành nghề:')]"
+            "/following-sibling::strong//a/text()"
+        ).getall()).strip()
+        item["work_mode"]       = None
+        item["number_recruit"]  = response.xpath(
+            "//span[contains(@class,'text-muted') and contains(text(),'Số lượng tuyển:')]"
+            "/following-sibling::strong/text()"
+        ).get("").strip()
+        item["company_size"]    = None
+        item["company_industry"]= None
+        item["scraped_at"]      = datetime.now()
+
+        # FIX: yield item trước, company page là bonus không bắt buộc
+        company_url = response.css("div.card-company a::attr(href)").get()
+        if company_url:
+            yield scrapy.Request(
+                url=response.urljoin(company_url),
+                meta={
+                    # FIX: KHÔNG dùng playwright, giảm timeout
+                    "job_item": item,
+                    "handle_httpstatus_list": [404, 403],  # không crash nếu lỗi
+                },
+                callback=self.parse_company_page,
+                errback=self.company_errback,  # FIX: xử lý timeout/error
+            )
+        else:
+            yield item  # không có company URL → yield luôn
+
+    def parse_company_page(self, response):
+        item = response.meta["job_item"]
+        # Nếu bị redirect hay lỗi → yield item gốc không có company info
+        if response.status in (403, 404):
+            yield item
+            return
+
+        item["company_size"] = response.css(
+            "li.d-flex i.pb-heroicons-users ~ span::text"
+        ).get("").strip() or None
+        item["company_industry"] = response.css(
+            "div.company-category span.company-category-list span::text"
+        ).get("").strip() or None
+        yield item
+
+    def company_errback(self, failure):
+        # FIX: Timeout/error ở company page → vẫn yield item job
+        item = failure.request.meta.get("job_item")
+        if item:
+            self.logger.warning(f"[jobsgo] Company page lỗi — yield item không có company info")
+            yield item
