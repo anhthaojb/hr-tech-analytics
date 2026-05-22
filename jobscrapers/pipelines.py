@@ -250,11 +250,11 @@ _INSERT_SQL = """
         job_category, number_recruit, education_level,
         job_description, job_requirement, raw_about_job,
         job_posted_at, job_deadline, scraped_at,
-        is_valid, error_log
+        is_valid, error_log, ai_processed
     ) VALUES (
         %s,%s,%s,%s, %s,%s,%s,%s,
         %s,%s,%s,%s, %s,%s,%s,%s,
-        %s,%s, %s,%s,%s, %s,%s
+        %s,%s, %s,%s,%s, %s,%s,%s
     )
     ON CONFLICT (job_url) DO UPDATE SET
         job_title        = EXCLUDED.job_title,
@@ -268,10 +268,11 @@ _INSERT_SQL = """
         job_posted_at    = EXCLUDED.job_posted_at,
         scraped_at       = EXCLUDED.scraped_at,
         is_valid         = EXCLUDED.is_valid
+        -- ai_processed KHÔNG update để tránh reset về False khi scrape lại
 """
 
-
 def _insert_params(item: dict) -> tuple:
+    website = (item.get("website") or "").lower().strip()
     return (
         item.get("website"),
         item.get("job_title"),
@@ -290,14 +291,13 @@ def _insert_params(item: dict) -> tuple:
         item.get("education_level"),
         item.get("job_description"),
         item.get("job_requirement"),
-        item.get("raw_about_job"),
         item.get("job_posted_at"),
         item.get("job_deadline"),
         item.get("scraped_at"),
-        bool(item.get("is_valid", True)),   # [THAY ĐỔI 9] True/False
+        bool(item.get("is_valid", True)),
         item.get("error_log"),
+        False if website == "linkedin" else True,  # linkedin → AI xử lý sau
     )
-
 
 # ==============================================================================
 # 5. save_to_db  [THAY ĐỔI 3+4 — rowcount logic khác psycopg2]

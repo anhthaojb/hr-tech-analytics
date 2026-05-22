@@ -623,7 +623,7 @@ def _sanity_check(val, currency):
 
 def parse_compensation(raw: str) -> dict:
     _base = {"salary_min": None, "salary_max": None, "salary_currency": None,
-             "conversion_rate": None, "is_negotiable": True}
+             "conversion_rate": None, "is_negotiable": True, "salary_type": "negotiable"}
     s = (raw or "").strip()
     if not s:
         return _base
@@ -687,14 +687,23 @@ def parse_compensation(raw: str) -> dict:
         sal_min, sal_max = sal_max, sal_min
     if sal_min is None and sal_max is None:
         return _base
+    if explicit_yearly:
+        salary_type = "yearly"
+    elif explicit_hourly:
+        salary_type = "hourly"
+    elif re.search(r"per\s*task|/\s*task|by\s*task", s.lower()):
+        salary_type = "per_task"
+    else:
+        salary_type = "monthly"
+
     return {
         "salary_min":      int(sal_min) if sal_min is not None else None,
         "salary_max":      int(sal_max) if sal_max is not None else None,
         "salary_currency": currency,
         "conversion_rate": rate,
-        "is_negotiable":   False,   # [THAY ĐỔI] 0 → False
+        "is_negotiable":   False,
+        "salary_type":     salary_type,
     }
-
 
 _EXP_REQUIREMENT_KW = [
     "tối thiểu", "yêu cầu", "cần có", "có ít nhất", "ít nhất",
@@ -1048,7 +1057,7 @@ class RecruitmentETL:
                 df = pd.read_sql(
                     f"SELECT * FROM {SRC_TABLE} "
                     f"WHERE is_valid = TRUE "
-                    f"AND LEFT(scraped_at, 10) = :dt",
+                    f"AND scraped_at::date = CURRENT_DATE;",
                     conn, params={"dt": date_str}
                 )
                 target_date = date_str
@@ -1249,7 +1258,7 @@ class RecruitmentETL:
             "job_title_clean", "job_title_detect", "job_category_clean", "is_it",
             "job_type_clean", "work_mode_clean",
             "salary_min", "salary_max", "salary_currency",
-            "conversion_rate", "is_negotiable",
+            "conversion_rate", "is_negotiable", "salary_type",
             "exp_min_yr", "exp_max_yr", "is_exp_required", "level_clean",
             "hard_skills", "soft_skills", "major", "certifications", "languages",
             "education_clean", "company_size_min", "company_size_max",

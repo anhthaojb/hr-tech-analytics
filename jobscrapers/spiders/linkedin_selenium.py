@@ -35,24 +35,24 @@ if unknown and unknown[0] in ["daily", "full"]:
     args.mode = unknown[0]
 
 # ===== CONFIG =====
-MAX_JOBS_PER_KEYWORD = 10
+MAX_JOBS_PER_KEYWORD = 5
 JOB_DETAIL_WAIT      = 12
 MIN_ABOUT_JOB_CHARS  = 200
 DAILY_MAX_AGE_DAYS   = 3
 
 KEYWORDS_BY_CATEGORY = {
-    # "software_dev": [
-    #     "software engineer",
-    #     "backend developer",
-    #     "frontend developer",
-    #     "full stack developer",
-    # ],
-    # "data": [
-    #     "data analyst",
-    #     "data scientist",
-    #     "data engineer",
-    #     "business intelligence",
-    # ],
+    "software_dev": [
+        "software engineer",
+        "backend developer",
+        "frontend developer",
+        "full stack developer",
+    ],
+    "data": [
+        "data analyst",
+        "data scientist",
+        "data engineer",
+        "business intelligence",
+    ],
     "devops_cloud": [
         "devops engineer",
         "cloud engineer",
@@ -319,7 +319,6 @@ def parse_job(driver, keyword, category):
     if not job_title:
         return None
 
-    raw_about_job = None
     DESC_SELS = [
         "div#job-details",
         "div.jobs-description__content",
@@ -421,8 +420,7 @@ def parse_job(driver, keyword, category):
         "company_industry": company_industry,
         "job_category"    : keyword,
         "number_recruit"  : None,
-        "raw_about_job"   : raw_about_job,
-        "job_description" : None,
+        "job_description" : raw_about_job,
         "job_requirement" : None,
         "compensation"    : None,
         "level"           : None,
@@ -561,7 +559,6 @@ def scrape_keyword(driver, keyword, category, seen_urls, cur, conn, mode, tracke
 
             seen_urls.add(normalized_url)
             raw["job_url"]         = normalized_url
-            raw["job_description"] = None  
             raw["job_requirement"] = None   
 
             cur, conn = ensure_db_connection(cur, conn)
