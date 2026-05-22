@@ -1,384 +1,684 @@
-"""
-itviec.py — Scrapy + Playwright version
-========================================
-Viết lại từ itviec_selenium.py (undetected-chromedriver) sang Scrapy spider.
-
-THAY ĐỔI CHÍNH:
-  - Không cần login / cookie (itviec cho search ẩn danh)
-  - Không cần undetected-chromedriver
-  - Chạy được trên GitHub Actions CI (headless Playwright)
-  - Tích hợp vào pipeline Scrapy bình thường qua run_spiders.py
-  - Giữ nguyên KEYWORDS_BY_CATEGORY, _is_old(), _get_section() từ bản gốc
-"""
-
+import sys
+import time
+import os
 import re
-from bs4 import BeautifulSoup
-from datetime import datetime
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import json
+import signal
+import argparse
+from datetime import datetime, date
 from urllib.parse import quote_plus
+from pathlib import Path
 
-import scrapy
-from scrapy_playwright.page import PageMethod
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import StaleElementReferenceException
+from bs4 import BeautifulSoup
+from pipelines import RunTracker, clean_dict, get_db_connection, save_to_db
+import chromedriver_autoinstaller
+chromedriver_autoinstaller.install(no_ssl=True)
+# =========================================================
+#  CONFIG
+# =========================================================
 
-from jobscrapers.items import JobItem
+MAX_JOBS_PER_KEYWORD = 10
 
+KEYWORDS_BY_CATEGORY = {
+    "software_dev": [
+        ".NET Developer",
+        "Back End Developer",
+        "Back End Web Developer",
+        "Front End Developer",
+        "Front End Web Developer",
+        "Full Stack Developer",
+        "Full Stack Web Developer",
+        "Java Developer",
+        "Java Web Developer",
+        "NodeJS Developer",
+        "PHP Developer",
+        "Python Developer",
+        "Python Web Developer",
+        "Senior Back End Developer",
+        "Senior Front End Developer",
+        "Senior Full Stack Developer",
+        "Senior Java Developer",
+        "C++ Developer",
+        "Embedded Engineer",
+    ],
+    "mobile": [
+        "Android App Developer",
+        "Android Developer",
+        "Mobile Apps Developer",
+        "iOS Developer",
+    ],
+    "architecture": [
+        "Software Architecture",
+        "Solution Architect",
+        "System Engineer",
+        "System Administrator",
+    ],
+    "management": [
+        "Bridge Project Management",
+        "Business Analysis",
+        "Leadership",
+        "Product Management",
+        "Product Owner",
+        "Senior Product Owner",
+        "Project Management",
+    ],
+    "design_qa": [
+        "UX UI Designer",
+        "Tester",
+    ],
+    "data": [
+        "Data Analyst",
+        "Data Scientist",
+        "Data Engineer",
+        "Business Intelligence",
+        "Database Administrator",
+        "ETL Developer",
+        "Data Architect",
+        "Big Data Engineer",
+        "Analytics Engineer",
+    ],
+    "ai_ml": [
+        "AI Engineer",
+        "Machine Learning Engineer",
+        "NLP Engineer",
+        "Computer Vision Engineer",
+        "Deep Learning Engineer",
+        "MLOps Engineer",
+        "Generative AI Engineer",
+        "LLM Engineer",
+        "AI Research Engineer",
+    ],
+}
+COOKIE_FILE = Path("data") / "itviec_cookies.json"
 
-class ItviecSpider(scrapy.Spider):
-    name = "itviec"
-    allowed_domains = ["itviec.com"]
+# =========================================================
+#  SELECTORS
+# =========================================================
 
-    MAX_JOBS_PER_KEYWORD = 10
+SEL_JOB_CARDS = [
+    "div.job-card[data-search--job-selection-job-slug-value]",
+    "div.job-card",
+]
+SEL_DETAIL_LOADED = [
+    "section.job-description",
+    "div.job-details--content",
+    "h1.text-it-black",
+]
+SEL_NEXT_PAGE = [
+    (By.CSS_SELECTOR, "div.page.next a"),
+    (By.CSS_SELECTOR, "a[rel='next']"),
+    (By.CSS_SELECTOR, "a.next_page"),
+]
 
-    KEYWORDS_BY_CATEGORY = {
-        "software_dev": [
-            ".NET Developer", "Back End Developer", "Front End Developer",
-            "Full Stack Developer", "Java Developer", "NodeJS Developer",
-            "PHP Developer", "Python Developer", "Senior Back End Developer",
-            "Senior Front End Developer", "Senior Full Stack Developer",
-            "C++ Developer", "Embedded Engineer",
-        ],
-        "mobile": [
-            "Android Developer", "iOS Developer", "Mobile Apps Developer",
-        ],
-        "architecture": [
-            "Solution Architect", "System Engineer", "System Administrator",
-        ],
-        "management": [
-            "Business Analysis", "Product Management", "Product Owner",
-            "Project Management", "Bridge Project Management",
-        ],
-        "design_qa": [
-            "UX UI Designer", "Tester",
-        ],
-        "data": [
-            "Data Analyst", "Data Scientist", "Data Engineer",
-            "Business Intelligence", "Database Administrator",
-            "ETL Developer", "Analytics Engineer",
-        ],
-        "ai_ml": [
-            "AI Engineer", "Machine Learning Engineer", "NLP Engineer",
-            "Computer Vision Engineer", "MLOps Engineer",
-            "Generative AI Engineer", "LLM Engineer",
-        ],
-    }
+# =========================================================
+#  KIỂM TRA NGÀY — dùng cho daily mode
+# =========================================================
 
-    # ------------------------------------------------------------------
-    # Init
-    # ------------------------------------------------------------------
+# def _is_old(posted_text: str) -> bool:
+#     if not posted_text:
+#         return False
+#     return bool(re.search(
+#         r"\d+\s+(?:day|week|month|year)s?\s+ago",
+#         posted_text,
+#         re.IGNORECASE,
+#     ))
+def _is_old(posted_text: str, max_days: int = 3) -> bool:
+    m = re.search(r"(\d+)\s+(day|week|month|year)s?\s+ago", posted_text, re.IGNORECASE)
+    if not m:
+        return False
+    n, unit = int(m.group(1)), m.group(2).lower()
+    age = {"day": n, "week": n*7, "month": n*30, "year": n*365}.get(unit, 0)
+    return age > max_days
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._kw_counts:  dict[str, int] = {}   # keyword → jobs yielded
-        self._kw_stopped: set[str]       = set() # keywords đã gặp job cũ
+# =========================================================
+#  DEBUG HELPER
+# =========================================================
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+def debug_job_structure(driver):
+    """In ra tất cả h2/h3 và section tìm thấy trên trang detail."""
+    soup = BeautifulSoup(driver.page_source, "html.parser")
 
-    def _get_mode(self) -> str:
-        return self.crawler.settings.get("CRAWL_MODE", "daily")
+    print("\n===== DEBUG HEADINGS =====")
+    for tag in soup.find_all(["h2", "h3"]):
+        parent = tag.find_parent("div") or tag.find_parent("section")
+        print(f"[{tag.name}] '{tag.get_text(strip=True)}'")
+        print(f"  parent classes: {parent.get('class') if parent else 'N/A'}")
+        print()
 
-    @staticmethod
-    def _is_old(posted_text: str, max_days: int = 3) -> bool:
-        m = re.search(
-            r"(\d+)\s+(day|week|month|year)s?\s+ago",
-            posted_text or "", re.IGNORECASE,
-        )
-        if not m:
-            return False
-        n, unit = int(m.group(1)), m.group(2).lower()
-        age = {"day": n, "week": n * 7, "month": n * 30, "year": n * 365}.get(unit, 0)
-        return age > max_days
+    print("===== ALL SECTIONS =====")
+    for sec in soup.find_all("section"):
+        print(f"section class={sec.get('class')}, first 80 chars: {sec.get_text()[:80]!r}")
+    print("=========================\n")
 
-    @staticmethod
-    def _get_section(html: str, heading_keywords: list[str]) -> str:
-        """
-        Dùng BeautifulSoup tìm heading khớp, rồi lấy nội dung block cha.
-        Giữ nguyên logic từ get_paragraph_by_heading() trong bản Selenium.
-        """
-        soup = BeautifulSoup(html, "html.parser")
-        for tag in soup.find_all(["h2", "h3"]):
-            heading_text = tag.get_text(strip=True).lower()
-            if any(kw in heading_text for kw in heading_keywords):
-                parent = tag.find_parent(["div", "section"])
-                while parent:
-                    text = parent.get_text(separator="\n", strip=True)
-                    if 50 < len(text) < 8000:
-                        return text
-                    parent = parent.find_parent(["div", "section"])
+# =========================================================
+#  SELENIUM HELPERS
+# =========================================================
+
+def safe_text(el):
+    try:
+        return el.text.strip()
+    except StaleElementReferenceException:
         return ""
 
-    # ------------------------------------------------------------------
-    # start — một request cho mỗi keyword
-    # ------------------------------------------------------------------
 
-    async def start(self):
-        for category, keywords in self.KEYWORDS_BY_CATEGORY.items():
-            for keyword in keywords:
-                self._kw_counts[keyword] = 0
-                yield scrapy.Request(
-                    url=f"https://itviec.com/it-jobs?query={quote_plus(keyword)}",
-                    callback=self.parse_listing,
-                    cb_kwargs={"keyword": keyword, "category": category},
-                    meta={
-                        "playwright": True,
-                        "playwright_page_methods": [
-                            PageMethod(
-                                "wait_for_selector",
-                                "div.job-card",
-                                timeout=15000,
-                            ),
-                        ],
-                    },
-                )
+def wait_any_css(driver, css_selectors, timeout=10):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for sel in css_selectors:
+            els = driver.find_elements(By.CSS_SELECTOR, sel)
+            if els:
+                return sel, els
+        time.sleep(0.5)
+    return None, []
 
-    # ------------------------------------------------------------------
-    # parse_listing — trang danh sách
-    # ------------------------------------------------------------------
 
-    def parse_listing(self, response, keyword: str, category: str):
-        if keyword in self._kw_stopped:
-            return
+def find_first(driver, selectors_list, timeout=8):
+    wait = WebDriverWait(driver, timeout)
+    for by, sel in selectors_list:
+        try:
+            el = wait.until(EC.presence_of_element_located((by, sel)))
+            if el.is_displayed():
+                return el
+        except Exception:
+            continue
+    return None
 
-        mode = self._get_mode()
 
-        for card in response.css(
-            "div.job-card[data-search--job-selection-job-slug-value]"
-        ):
-            # Kiểm tra đã đủ quota chưa
-            if self._kw_counts.get(keyword, 0) >= self.MAX_JOBS_PER_KEYWORD:
-                self._kw_stopped.add(keyword)
-                self.logger.info(
-                    f"[itviec] {keyword!r} đủ {self.MAX_JOBS_PER_KEYWORD} jobs — dừng"
-                )
-                break
+def get_text_first(driver, selectors):
+    for sel in selectors:
+        els = driver.find_elements(By.CSS_SELECTOR, sel)
+        if els:
+            t = safe_text(els[0])
+            if t:
+                return t
+    return ""
 
-            slug = card.attrib.get(
-                "data-search--job-selection-job-slug-value", ""
-            )
-            if not slug:
-                continue
 
-            posted_text = card.css(
-                "span.small-text.text-dark-grey::text"
-            ).get("").strip()
+def get_text_all(driver, selectors):
+    for sel in selectors:
+        els = driver.find_elements(By.CSS_SELECTOR, sel)
+        if els:
+            return [t for t in (safe_text(e) for e in els) if t]
+    return []
 
-            # Daily mode: dừng keyword nếu gặp job cũ
-            if mode == "daily" and self._is_old(posted_text):
-                self.logger.info(
-                    f"[itviec][daily] Gặp job cũ ({posted_text!r})"
-                    f" — dừng keyword {keyword!r}"
-                )
-                self._kw_stopped.add(keyword)
-                break
 
-            # Meta từ card để bổ sung cho detail page
-            card_meta = {
-                "keyword"      : keyword,
-                "category"     : category,
-                "job_posted_at": posted_text,
-                "salary"       : (
-                    card.css("div.salary span.fw-500::text").get("").strip()
-                    or card.css("div.salary::text").get("").strip()
-                ),
-                "work_mode"    : card.css(
-                    "div.text-rich-grey.flex-shrink-0::text"
-                ).get("").strip(),
-                "location"     : (
-                    card.attrib.get("title", "")
-                    or card.css(
-                        "div.text-rich-grey.text-truncate.text-nowrap::text"
-                    ).get("").strip()
-                ),
-                "job_expertise": (
-                    card.css(
-                        "a.text-decoration-dot-underline.small-text::attr(title)"
-                    ).get("")
-                    or card.css(
-                        "a.text-decoration-dot-underline.small-text::text"
-                    ).get("").strip()
-                ),
-                "skills"       : card.css(
-                    'a[data-responsive-tag-list-target="tag"]::text'
-                ).getall(),
-            }
+def get_employer_row(driver, label):
+    rows = driver.find_elements(
+        By.CSS_SELECTOR, "section.job-show-employer-info div.row"
+    )
+    for row in rows:
+        cols = row.find_elements(By.CSS_SELECTOR, "div.col")
+        if len(cols) >= 2 and label.lower() in safe_text(cols[0]).lower():
+            return safe_text(cols[1])
+    return ""
 
-            yield scrapy.Request(
-                url=f"https://itviec.com/it-jobs/{slug}",
-                callback=self.parse_job,
-                meta={
-                    "playwright": True,
-                    "playwright_page_methods": [
-                        PageMethod(
-                            "wait_for_selector",
-                            "h1.text-it-black",
-                            timeout=10000,
-                        ),
-                    ],
-                    "card_meta": card_meta,
-                    "keyword"  : keyword,
-                },
-            )
 
-        # Phân trang — chỉ tiếp tục nếu keyword chưa bị dừng
-        if keyword not in self._kw_stopped:
-            next_href = response.css("div.page.next a::attr(href)").get()
-            if next_href:
-                yield scrapy.Request(
-                    url=response.urljoin(next_href),
-                    callback=self.parse_listing,
-                    cb_kwargs={"keyword": keyword, "category": category},
-                    meta={
-                        "playwright": True,
-                        "playwright_page_methods": [
-                            PageMethod(
-                                "wait_for_selector",
-                                "div.job-card",
-                                timeout=15000,
-                            ),
-                        ],
-                    },
-                )
+def get_paragraph_by_heading(driver, heading_text):
+    """
+    Parse page_source bằng BeautifulSoup, tìm h2/h3 khớp heading_text,
+    lấy toàn bộ nội dung của block cha chứa nó.
+    """
+    soup = BeautifulSoup(driver.page_source, "html.parser")
 
-    # ------------------------------------------------------------------
-    # parse_job — trang chi tiết
-    # ------------------------------------------------------------------
+    for tag in soup.find_all(["h2", "h3"]):
+        if heading_text.lower() not in tag.get_text(strip=True).lower():
+            continue
 
-    def parse_job(self, response):
-        meta      = response.meta.get("card_meta", {})
-        keyword   = response.meta.get("keyword", "")
+        # Đi lên tìm div/section cha gần nhất có nội dung thực
+        parent = tag.find_parent(["div", "section"])
+        while parent:
+            text = parent.get_text(separator="\n", strip=True)
+            # Đủ dài và không phải toàn bộ trang
+            if 50 < len(text) < 8000:
+                return text
+            parent = parent.find_parent(["div", "section"])
 
-        job_title = response.css("h1.text-it-black::text").get("").strip()
-        if not job_title:
-            self.logger.warning(f"[itviec] Không tìm thấy job_title — bỏ qua {response.url}")
-            return
+    return ""
 
-        # ── Company ───────────────────────────────────────────────────
-        company_title = (
-            response.css("div.employer-name::text").get("").strip()
-            or response.css(
-                "div.job-header-info div.employer-name::text"
-            ).get("").strip()
+# =========================================================
+#  PARSE JOB DETAIL
+# =========================================================
+
+def parse_job(driver, keyword, category, list_meta):
+    # ── Bật debug để xem HTML thực tế (tắt sau khi đã xác nhận selector) ──
+    # debug_job_structure(driver)
+
+    job_title = get_text_first(driver, ["h1.text-it-black", "h1"])
+    if not job_title:
+        return None
+
+    company_title = get_text_first(driver, [
+        "div.employer-name",
+        "div.job-header-info div.employer-name",
+    ])
+
+    compensation = list_meta.get("salary") or get_text_first(driver, [
+        "div.salary span.fw-500",
+        "div.salary",
+    ])
+
+    location = list_meta.get("location") or get_text_first(driver, [
+        "div.d-flex.flex-column.gap-2 > div:first-child span.normal-text",
+        "div.job-show-info span.normal-text.text-rich-grey",
+    ])
+
+    work_mode = list_meta.get("work_mode")
+    if not work_mode:
+        preview_items = driver.find_elements(
+            By.CSS_SELECTOR, "div.preview-header-item"
         )
+        if preview_items:
+            spans = preview_items[0].find_elements(
+                By.CSS_SELECTOR, "span.normal-text"
+            )
+            work_mode = safe_text(spans[0]) if spans else ""
 
-        # ── Compensation ──────────────────────────────────────────────
-        compensation = (
-            meta.get("salary", "")
-            or response.css("div.salary span.fw-500::text").get("").strip()
-            or response.css("div.salary::text").get("").strip()
-        ) or None
+    job_posted_at = list_meta.get("job_posted_at")
+    if not job_posted_at:
+        preview_items = driver.find_elements(
+            By.CSS_SELECTOR, "div.preview-header-item"
+        )
+        if len(preview_items) >= 2:
+            spans = preview_items[1].find_elements(
+                By.CSS_SELECTOR, "span.normal-text"
+            )
+            job_posted_at = safe_text(spans[0]) if spans else ""
 
-        # ── Location ──────────────────────────────────────────────────
-        location = (
-            meta.get("location", "")
-            or response.css(
-                "div.d-flex.flex-column.gap-2 > div:first-child span.normal-text::text"
-            ).get("").strip()
-            or response.css(
-                "div.job-show-info span.normal-text.text-rich-grey::text"
-            ).get("").strip()
-        ) or None
+    skills = get_text_all(driver, ["a.itag.itag-light.itag-sm"])
+    domain = get_text_all(driver, ["div.itag.bg-light-grey.itag-sm"])
 
-        # ── Work mode & posted_at từ preview-header-item ──────────────
-        work_mode     = meta.get("work_mode", "")
-        job_posted_at = meta.get("job_posted_at", "")
+    expertise_from_card = list_meta.get("job_expertise")
+    job_category = (
+        [expertise_from_card] if expertise_from_card
+        else skills or list_meta.get("skills")
+    )
 
-        preview_items = response.css("div.preview-header-item")
-        if not work_mode and preview_items:
-            work_mode = preview_items[0].css(
-                "span.normal-text::text"
-            ).get("").strip()
-        if not job_posted_at and len(preview_items) >= 2:
-            job_posted_at = preview_items[1].css(
-                "span.normal-text::text"
-            ).get("").strip()
+    level = None
+    for kw in ["fresher", "junior", "mid", "senior", "lead", "manager",
+               "director", "principal", "intern", "staff", "associate"]:
+        if kw in job_title.lower():
+            level = kw.capitalize()
+            break
 
-        # ── Skills & category ─────────────────────────────────────────
-        skills = response.css("a.itag.itag-light.itag-sm::text").getall()
-        domain = response.css("div.itag.bg-light-grey.itag-sm::text").getall()
+    company_size = get_employer_row(driver, "Company size")
+    company_industry = (
+        ", ".join(domain) if domain
+        else get_employer_row(driver, "Company industry")
+    )
 
-        expertise    = meta.get("job_expertise", "")
-        job_category = (
-            [expertise] if expertise
-            else skills or meta.get("skills", [])
-        ) or None
+    # ── Job description ────────────────────────────────────────────────────
+    job_description = get_paragraph_by_heading(driver, "Job description")
+    if not job_description:
+        job_description = get_paragraph_by_heading(driver, "Mô tả công việc")
+    if not job_description:
+        job_description = get_text_first(driver, [
+            "section.job-content",
+            "div.job-content",
+        ])
 
-        # ── Level từ job title ────────────────────────────────────────
-        level       = None
-        title_lower = job_title.lower()
-        for kw in [
-            "fresher", "junior", "mid", "senior", "lead",
-            "manager", "director", "principal", "intern", "staff", "associate",
-        ]:
-            if kw in title_lower:
-                level = kw.capitalize()
+    # ── Job requirement ────────────────────────────────────────────────────
+    job_requirement = get_paragraph_by_heading(driver, "Your skills and experience")
+    if not job_requirement:
+        job_requirement = get_paragraph_by_heading(driver, "Skills and experience")
+    if not job_requirement:
+        job_requirement = get_paragraph_by_heading(driver, "Yêu cầu công việc")
+    if not job_requirement:
+        job_requirement = get_paragraph_by_heading(driver, "skills and experience")
+
+    # ── In debug để kiểm tra kết quả ──────────────────────────────────────
+    # print(f"\n  [DEBUG] job_description ({len(job_description)} chars): {job_description[:120]!r}")
+    # print(f"  [DEBUG] job_requirement ({len(job_requirement)} chars): {job_requirement[:120]!r}")
+
+    experience = None
+    if job_requirement:
+        m = re.search(
+            r"(\d+)\+?\s*(?:năm|year)s?\s*(?:of\s*)?(?:kinh nghiệm|experience)",
+            job_requirement, re.IGNORECASE,
+        )
+        if m:
+            experience = m.group(0)
+
+    return {
+        "website"         : "itviec",
+        "job_title"       : job_title,
+        "company_title"   : company_title,
+        "location"        : location,
+        "experience"      : experience,
+        "compensation"    : compensation,
+        "job_type"        : "Full-time",
+        "work_mode"       : work_mode,
+        "level"           : level,
+        "job_url"         : driver.current_url,
+        "company_size"    : company_size,
+        "company_industry": company_industry,
+        "job_category"    : job_category,
+        "number_recruit"  : None,
+        "education_level" : None,
+        "job_description" : job_description,
+        "job_requirement" : job_requirement,
+        "job_posted_at"   : job_posted_at,
+        "job_deadline"    : None,
+        "scraped_at"      : datetime.now().isoformat(),
+        "skills"          : skills,
+        "_search_keyword" : keyword,
+    }
+
+# =========================================================
+#  PARSE CARD META
+# =========================================================
+
+def extract_card_meta(card):
+    def css(sel):
+        try:
+            return safe_text(card.find_element(By.CSS_SELECTOR, sel))
+        except Exception:
+            return ""
+
+    def attr(sel, attribute):
+        try:
+            el = card.find_element(By.CSS_SELECTOR, sel)
+            return (el.get_attribute(attribute) or "").strip()
+        except Exception:
+            return ""
+
+    def css_all(sel):
+        try:
+            els = card.find_elements(By.CSS_SELECTOR, sel)
+            return [t for t in (safe_text(e) for e in els) if t]
+        except Exception:
+            return []
+
+    return {
+        "slug"         : card.get_attribute(
+            "data-search--job-selection-job-slug-value"
+        ) or "",
+        "job_posted_at": css("span.small-text.text-dark-grey"),
+        "salary"       : css("div.salary span.fw-500") or css("div.salary"),
+        "job_expertise": (
+            attr("a.text-decoration-dot-underline.small-text", "title")
+            or css("a.text-decoration-dot-underline.small-text")
+        ),
+        "work_mode"    : css("div.text-rich-grey.flex-shrink-0"),
+        "location"     : (
+            attr("div.text-rich-grey.text-truncate.text-nowrap", "title")
+            or css("div.text-rich-grey.text-truncate.text-nowrap")
+        ),
+        "skills"       : css_all('a[data-responsive-tag-list-target="tag"]'),
+    }
+
+# =========================================================
+#  CORE SCRAPE — một keyword
+# =========================================================
+
+def _click_next_page(driver):
+    next_el = find_first(driver, SEL_NEXT_PAGE, timeout=5)
+    if not next_el:
+        return False
+    href = next_el.get_attribute("href")
+    if href:
+        driver.get(href)
+        return True
+    try:
+        driver.execute_script("arguments[0].click();", next_el)
+        return True
+    except Exception:
+        return False
+
+
+def scrape_keyword(driver, keyword, category, seen_urls, cur, conn, mode, tracker):
+    search_url = f"https://itviec.com/it-jobs?query={quote_plus(keyword)}"
+    driver.get(search_url)
+    print(f"\n[{category}] {keyword!r}")
+
+    matched, _ = wait_any_css(driver, SEL_JOB_CARDS, timeout=15)
+    if not matched:
+        print("  ⚠ Job list không load — bỏ qua")
+        return 0
+
+    job_count        = 0
+    page             = 1
+    current_list_url = driver.current_url
+    stop_keyword     = False
+
+    while job_count < MAX_JOBS_PER_KEYWORD and not stop_keyword:
+        print(f"  📄 Trang {page} | {job_count}/{MAX_JOBS_PER_KEYWORD}")
+
+        _, cards = wait_any_css(driver, SEL_JOB_CARDS, timeout=12)
+        if not cards:
+            print("  ⚠ Không tìm thấy card")
+            break
+
+        page_metas = []
+        for card in cards:
+            try:
+                meta = extract_card_meta(card)
+                if not meta["slug"]:
+                    continue
+
+                if mode == "daily" and _is_old(meta["job_posted_at"]):
+                    print(
+                        f"  ⏹ [{mode}] Gặp job cũ "
+                        f"({meta['job_posted_at']!r}) — dừng keyword này"
+                    )
+                    stop_keyword = True
+                    break
+
+                page_metas.append(meta)
+            except StaleElementReferenceException:
+                continue
+
+        for meta in page_metas:
+            if job_count >= MAX_JOBS_PER_KEYWORD or stop_keyword:
                 break
 
-        # ── Company info từ employer section ─────────────────────────
-        company_size     = ""
-        company_industry = ", ".join(domain) if domain else ""
+            detail_url = f"https://itviec.com/it-jobs/{meta['slug']}"
+            driver.get(detail_url)
+            time.sleep(1.2)
 
-        for row in response.css("section.job-show-employer-info div.row"):
-            cols = row.css("div.col")
-            if len(cols) < 2:
-                continue
-            label = cols[0].css("::text").get("").lower()
-            value = " ".join(cols[1].css("::text").getall()).strip()
-            if "company size" in label:
-                company_size = value
-            elif not company_industry and "industry" in label:
-                company_industry = value
-
-        # ── Job description & requirement (dùng BS4 như bản gốc) ─────
-        html            = response.text
-        job_description = self._get_section(html, [
-            "job description", "mô tả công việc",
-        ])
-        job_requirement = self._get_section(html, [
-            "your skills and experience",
-            "skills and experience",
-            "yêu cầu công việc",
-        ])
-
-        # Fallback nếu không tìm được section
-        if not job_description:
-            job_description = response.css(
-                "section.job-content::text, div.job-content::text"
-            ).get("").strip()
-
-        # ── Experience từ requirement text ────────────────────────────
-        experience = None
-        if job_requirement:
-            m = re.search(
-                r"(\d+)\+?\s*(?:năm|year)s?\s*(?:of\s*)?(?:kinh nghiệm|experience)",
-                job_requirement, re.IGNORECASE,
+            matched_detail, _ = wait_any_css(
+                driver, SEL_DETAIL_LOADED, timeout=10
             )
-            if m:
-                experience = m.group(0)
+            if not matched_detail:
+                print(f"  ✗ Detail không load: {meta['slug']}")
+                continue
 
-        # ── Cập nhật đếm keyword ──────────────────────────────────────
-        self._kw_counts[keyword] = self._kw_counts.get(keyword, 0) + 1
+            real_url = driver.current_url
 
-        item = JobItem()
-        item["website"]          = "itviec"
-        item["job_url"]          = response.url
-        item["job_title"]        = job_title
-        item["company_title"]    = company_title or None
-        item["location"]         = location
-        item["experience"]       = experience
-        item["compensation"]     = compensation
-        item["job_type"]         = "Full-time"
-        item["work_mode"]        = work_mode or None
-        item["level"]            = level
-        item["company_size"]     = company_size or None
-        item["company_industry"] = company_industry or None
-        item["job_category"]     = job_category
-        item["number_recruit"]   = None
-        item["education_level"]  = None
-        item["job_description"]  = job_description or None
-        item["job_requirement"]  = job_requirement or None
-        item["job_posted_at"]    = job_posted_at or None
-        item["job_deadline"]     = None
-        item["scraped_at"]       = datetime.now()
-        item["skills"]           = skills
+            if real_url in seen_urls:
+                print(f"  ↩ Đã cào trong session: {real_url}")
+                continue
 
-        yield item
+            raw = parse_job(driver, keyword, category, meta)
+            if not raw:
+                print(f"  ✗ Parse thất bại: {meta['slug']}")
+                continue
+
+            item  = clean_dict(raw)
+            ok, status = save_to_db(cur, conn, item)
+            tracker.record(status, item)
+
+            seen_urls.add(real_url)
+            if status == "new":
+                job_count += 1
+
+            status = "✅ mới" if status== "new" else "🔄 updated"
+            print(f"  {status} [{job_count}] {item['job_title']} @ {item['company_title']}")
+
+            time.sleep(0.8)
+
+        if stop_keyword or job_count >= MAX_JOBS_PER_KEYWORD:
+            break
+
+        # driver.get(current_list_url)
+        wait_any_css(driver, SEL_JOB_CARDS, timeout=10)
+        time.sleep(0.5)
+
+        if not _click_next_page(driver):
+            print("  📭 Hết trang")
+            break
+
+        wait_any_css(driver, SEL_JOB_CARDS, timeout=12)
+        time.sleep(1)
+        current_list_url = driver.current_url
+        page += 1
+
+    return job_count
+
+# =========================================================
+#  DRIVER & LOGIN
+# =========================================================
+
+def init_driver():
+    opts = uc.ChromeOptions()
+    opts.add_argument("--start-maximized")
+    opts.add_experimental_option(
+        "prefs",
+        {"profile.managed_default_content_settings.images": 2}
+    )
+    return uc.Chrome(options=opts, driver_executable_path=chromedriver_autoinstaller.install())
+
+
+
+def _is_logged_in(driver):
+    return bool(driver.find_elements(
+        By.CSS_SELECTOR,
+        "a[href*='sign_out'], div.header-user, nav .avatar-wrapper"
+    ))
+
+
+def save_cookies(driver):
+    COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+        json.dump(driver.get_cookies(), f, ensure_ascii=False, indent=2)
+    print(f"✓ Đã lưu cookies → {COOKIE_FILE}")
+
+
+def load_cookies(driver):
+    if not COOKIE_FILE.exists():
+        return False
+    driver.get("https://itviec.com")
+    time.sleep(1)
+    with open(COOKIE_FILE, encoding="utf-8") as f:
+        cookies = json.load(f)
+    for cookie in cookies:
+        cookie.pop("sameSite", None)
+        cookie.pop("expiry", None)
+        try:
+            driver.add_cookie(cookie)
+        except Exception:
+            pass
+    driver.refresh()
+    time.sleep(2)
+    return True
+
+
+def login(driver):
+    if COOKIE_FILE.exists():
+        print("Tìm thấy cookie — đang thử load...")
+        load_cookies(driver)
+        driver.get("https://itviec.com/it-jobs")
+        time.sleep(2)
+        if _is_logged_in(driver):
+            print(f"✓ Đã login từ cookie")
+            return
+        print("Cookie hết hạn — yêu cầu login lại")
+        COOKIE_FILE.unlink(missing_ok=True)
+
+    driver.get("https://itviec.com/sign_in")
+    print("\n" + "="*55)
+    print("  Vui lòng ĐĂNG NHẬP THỦ CÔNG trên Chrome vừa mở.")
+    print("  Sau khi login xong, quay lại đây nhấn Enter.")
+    print("="*55)
+    input("  >>> Nhấn Enter khi đã login xong: ")
+
+    driver.get("https://itviec.com/it-jobs")
+    time.sleep(2)
+    if not _is_logged_in(driver):
+        raise Exception("Chưa detect được trạng thái login.")
+
+    save_cookies(driver)
+    print(f"✓ Đăng nhập thành công")
+
+# =========================================================
+#  MAIN
+# =========================================================
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        default="daily",
+        choices=["full", "daily"],
+        help="full = cào hết, daily = chỉ job mới trong 24h (mặc định)",
+    )
+    args = parser.parse_args()
+    mode = args.mode
+
+    print(f"\n{'='*55}")
+    print(f"🚀 ITviec scraper | mode={mode}")
+    print(f"{'='*55}")
+
+    driver = init_driver()
+
+    def _exit(sig, frame):
+        print("\n⛔ Ctrl+C — đóng driver...")
+        try:
+            driver.service.process.kill()
+        except Exception:
+            pass
+        os._exit(0)
+
+    signal.signal(signal.SIGINT, _exit)
+
+    conn, cur = get_db_connection()
+    tracker = RunTracker(website="itviec", cur=cur, conn=conn)
+
+    try:
+        login(driver)
+
+        seen_urls = set()
+        print("Session mới — sẽ INSERT mới hoặc UPDATE tất cả job tìm thấy")
+
+        total   = 0
+        summary = {}
+
+        for category, keywords in KEYWORDS_BY_CATEGORY.items():
+            summary[category] = {}
+            for keyword in keywords:
+                count = scrape_keyword(
+                    driver, keyword, category, seen_urls, cur, conn, mode, tracker
+                )
+                summary[category][keyword] = count
+                total += count
+                time.sleep(3)
+
+        print(f"\n{'='*55}")
+        print(f"🎉 HOÀN THÀNH | mode={mode} | {total} job → MySQL")
+        print(f"{'='*55}")
+        for cat, kw_counts in summary.items():
+            cat_total = sum(kw_counts.values())
+            print(f"  [{cat}] {cat_total} job")
+            for kw, cnt in kw_counts.items():
+                print(f"    • {kw!r}: {cnt}")
+
+    finally:
+        try:
+            tracker.finish()
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()

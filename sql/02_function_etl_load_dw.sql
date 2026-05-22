@@ -1,14 +1,3 @@
--- =============================================================================
--- FILE: 02_function_etl_load_dw.sql
--- MÔ TẢ: Chuyển đổi stored procedure MySQL → PostgreSQL function cho Supabase
--- CHẠY FILE NÀY SAU file 01_schema_supabase.sql
--- =============================================================================
--- GỌI HÀM:
---   SELECT sp_etl_load_dw('today', NULL);   -- load dữ liệu hôm nay
---   SELECT sp_etl_load_dw('date', '2025-01-15');  -- load một ngày cụ thể
---   SELECT sp_etl_load_dw('all', NULL);     -- reload toàn bộ (CẨNTHẬN!)
--- =============================================================================
-
 CREATE OR REPLACE FUNCTION sp_etl_load_dw(
     p_mode  VARCHAR(20),
     p_date  DATE DEFAULT NULL
@@ -22,7 +11,6 @@ BEGIN
     -- 0. TRUNCATE KHI MODE = 'all'
     -- =========================================================================
     IF p_mode = 'all' THEN
-        -- Tắt trigger để tránh conflict khi truncate có FK
         SET session_replication_role = 'replica';
         TRUNCATE TABLE
             bridge_jobrequire,
@@ -90,7 +78,6 @@ BEGIN
 
     -- =========================================================================
     -- 6. DIM_CONGTY
-    -- (UPSERT: cập nhật thông tin công ty nếu đã tồn tại)
     -- =========================================================================
     INSERT INTO dim_congty (ten_cong_ty, canonical_key, company_type, quy_mo_min, quy_mo_max)
     SELECT DISTINCT ON (ten_cong_ty)
@@ -101,7 +88,7 @@ BEGIN
         company_size_max
     FROM  fact_jobs_etl
     WHERE is_duplicate = FALSE
-    ORDER BY ten_cong_ty, etl_id DESC     -- lấy record mới nhất nếu có nhiều bản
+    ORDER BY ten_cong_ty, etl_id DESC
     ON CONFLICT (ten_cong_ty) DO UPDATE SET
         canonical_key = COALESCE(EXCLUDED.canonical_key, dim_congty.canonical_key),
         company_type  = COALESCE(EXCLUDED.company_type,  dim_congty.company_type),
@@ -119,13 +106,7 @@ BEGIN
     ON CONFLICT (ten_danh_muc) DO NOTHING;
 
     -- =========================================================================
-    -- 8. FACT_JOBPOSTINGS — load tất cả (kể cả duplicate)
-    --
-    -- Lưu ý chuyển đổi MySQL → PostgreSQL:
-    --   DATE(expr)              → expr::date
-    --   CURDATE()               → CURRENT_DATE
-    --   VALUES(col)             → EXCLUDED.col
-    --   ON DUPLICATE KEY UPDATE → ON CONFLICT (etl_id) DO UPDATE SET
+    -- 8. FACT_JOBPOSTINGS
     -- =========================================================================
     INSERT INTO fact_jobpostings (
         etl_id, job_url, ngay_dang,
@@ -135,7 +116,8 @@ BEGIN
         job_title_clean, job_title_detect,
         so_luong_tuyen,
         salary_min, salary_max, salary_avg,
-        salary_currency, conversion_rate, is_negotiable,
+        salary_currency, conversion_rate,
+        is_negotiable, salary_type,
         exp_min_yr, exp_max_yr, is_exp_required,
         etl_run_id, ngay_crawl, ngay_deadline
     )
@@ -159,7 +141,6 @@ BEGIN
         COALESCE(src.number_recruit_clean, 1),
         src.salary_min,
         src.salary_max,
-        -- Tính salary_avg
         CASE
             WHEN src.salary_min IS NOT NULL AND src.salary_max IS NOT NULL
                 THEN ROUND((src.salary_min + src.salary_max) / 2.0)
@@ -170,11 +151,11 @@ BEGIN
         src.salary_currency,
         src.conversion_rate,
         src.is_negotiable,
+        src.salary_type,
         src.exp_min_yr,
         src.exp_max_yr,
         src.is_exp_required,
         src.etl_run_id,
-        -- scraped_at là VARCHAR nên cast sang date
         CASE
             WHEN src.scraped_at IS NOT NULL AND src.scraped_at <> ''
             THEN src.scraped_at::date
@@ -186,24 +167,18 @@ BEGIN
 
     LEFT JOIN dim_diadiem dd
            ON src.location_province = dd.tinh_thanh
-
     LEFT JOIN dim_congty ct
            ON COALESCE(NULLIF(TRIM(src.company_name_clean), ''), 'Unknown') = ct.ten_cong_ty
-
     LEFT JOIN dim_nganh ng
            ON src.industry_level1 = ng.cap_do_1
           AND src.industry_level2 = ng.cap_do_2
-
     LEFT JOIN dim_capbac cb
            ON src.level_clean = cb.ten_cap_bac
-
     LEFT JOIN dim_hinhthuc ht
            ON COALESCE(NULLIF(src.job_type_clean,  ''), 'Full-time') = ht.job_type
           AND COALESCE(NULLIF(src.work_mode_clean, ''), 'Onsite')    = ht.work_mode
-
     LEFT JOIN dim_nguon ns
            ON src.website_clean = ns.ten_nguon
-
     LEFT JOIN dim_danhmuccongviec dm
            ON src.job_category_clean = dm.ten_danh_muc
 
@@ -229,6 +204,7 @@ BEGIN
         salary_currency  = EXCLUDED.salary_currency,
         conversion_rate  = EXCLUDED.conversion_rate,
         is_negotiable    = EXCLUDED.is_negotiable,
+        salary_type      = EXCLUDED.salary_type,
         exp_min_yr       = EXCLUDED.exp_min_yr,
         exp_max_yr       = EXCLUDED.exp_max_yr,
         is_exp_required  = EXCLUDED.is_exp_required,
@@ -236,195 +212,121 @@ BEGIN
         updated_at       = CURRENT_TIMESTAMP;
 
     -- =========================================================================
-    -- 9. DIM_REQUIRE — từ job KHÔNG duplicate
-    --
-    -- Lưu ý chuyển đổi MySQL → PostgreSQL:
-    --   JSON_TABLE(CONCAT('["', REGEXP_REPLACE(...), '"]'), '$[*]')
-    --   → CROSS JOIN LATERAL unnest(string_to_array(regexp_replace(..., 'g'), ','))
+    -- 9. DIM_REQUIRE
     -- =========================================================================
     INSERT INTO dim_require (require_type, require_value)
-    -- hard_skills
     SELECT DISTINCT 'hard_skill', TRIM(val)
     FROM  fact_jobs_etl
-    CROSS JOIN LATERAL
-          unnest(string_to_array(
-              regexp_replace(hard_skills, '\s*,\s*', ',', 'g'), ','
-          )) AS val
-    WHERE hard_skills IS NOT NULL
-      AND is_duplicate = FALSE
-      AND TRIM(val) <> ''
+    CROSS JOIN LATERAL unnest(string_to_array(
+        regexp_replace(hard_skills, '\s*,\s*', ',', 'g'), ',')) AS val
+    WHERE hard_skills IS NOT NULL AND is_duplicate = FALSE AND TRIM(val) <> ''
 
     UNION ALL
 
-    -- soft_skills
     SELECT DISTINCT 'soft_skill', TRIM(val)
     FROM  fact_jobs_etl
-    CROSS JOIN LATERAL
-          unnest(string_to_array(
-              regexp_replace(soft_skills, '\s*,\s*', ',', 'g'), ','
-          )) AS val
-    WHERE soft_skills IS NOT NULL
-      AND is_duplicate = FALSE
-      AND TRIM(val) <> ''
+    CROSS JOIN LATERAL unnest(string_to_array(
+        regexp_replace(soft_skills, '\s*,\s*', ',', 'g'), ',')) AS val
+    WHERE soft_skills IS NOT NULL AND is_duplicate = FALSE AND TRIM(val) <> ''
 
     UNION ALL
 
-    -- certifications
     SELECT DISTINCT 'certification', TRIM(val)
     FROM  fact_jobs_etl
-    CROSS JOIN LATERAL
-          unnest(string_to_array(
-              regexp_replace(certifications, '\s*,\s*', ',', 'g'), ','
-          )) AS val
-    WHERE certifications IS NOT NULL
-      AND is_duplicate = FALSE
-      AND TRIM(val) <> ''
+    CROSS JOIN LATERAL unnest(string_to_array(
+        regexp_replace(certifications, '\s*,\s*', ',', 'g'), ',')) AS val
+    WHERE certifications IS NOT NULL AND is_duplicate = FALSE AND TRIM(val) <> ''
 
     UNION ALL
 
-    -- languages
     SELECT DISTINCT 'language', TRIM(val)
     FROM  fact_jobs_etl
-    CROSS JOIN LATERAL
-          unnest(string_to_array(
-              regexp_replace(languages, '\s*,\s*', ',', 'g'), ','
-          )) AS val
-    WHERE languages IS NOT NULL
-      AND is_duplicate = FALSE
-      AND TRIM(val) <> ''
+    CROSS JOIN LATERAL unnest(string_to_array(
+        regexp_replace(languages, '\s*,\s*', ',', 'g'), ',')) AS val
+    WHERE languages IS NOT NULL AND is_duplicate = FALSE AND TRIM(val) <> ''
 
     UNION ALL
 
-    -- major
     SELECT DISTINCT 'major', TRIM(val)
     FROM  fact_jobs_etl
-    CROSS JOIN LATERAL
-          unnest(string_to_array(
-              regexp_replace(major, '\s*,\s*', ',', 'g'), ','
-          )) AS val
-    WHERE major IS NOT NULL
-      AND is_duplicate = FALSE
-      AND TRIM(val) <> ''
+    CROSS JOIN LATERAL unnest(string_to_array(
+        regexp_replace(major, '\s*,\s*', ',', 'g'), ',')) AS val
+    WHERE major IS NOT NULL AND is_duplicate = FALSE AND TRIM(val) <> ''
 
     ON CONFLICT (require_type, require_value) DO NOTHING;
 
     -- =========================================================================
-    -- 10. BRIDGE_JOBREQUIRE — từ job KHÔNG duplicate
+    -- 10. BRIDGE_JOBREQUIRE
     -- =========================================================================
     INSERT INTO bridge_jobrequire (fact_id, require_id)
 
-    -- hard_skills
     SELECT f.posting_id, r.require_id
     FROM  fact_jobs_etl src
     JOIN  fact_jobpostings f ON src.etl_id = f.etl_id
-    CROSS JOIN LATERAL
-          unnest(string_to_array(
-              regexp_replace(src.hard_skills, '\s*,\s*', ',', 'g'), ','
-          )) AS val
-    JOIN  dim_require r
-           ON r.require_type  = 'hard_skill'
-          AND r.require_value = TRIM(val)
-    WHERE src.hard_skills IS NOT NULL
-      AND src.is_duplicate = FALSE
-      AND TRIM(val) <> ''
-      AND (
-               p_mode = 'all'
-            OR (p_mode = 'today' AND src.etl_processed_at::date = CURRENT_DATE)
-            OR (p_mode = 'date'  AND src.etl_processed_at::date = p_date)
-          )
+    CROSS JOIN LATERAL unnest(string_to_array(
+        regexp_replace(src.hard_skills, '\s*,\s*', ',', 'g'), ',')) AS val
+    JOIN  dim_require r ON r.require_type = 'hard_skill' AND r.require_value = TRIM(val)
+    WHERE src.hard_skills IS NOT NULL AND src.is_duplicate = FALSE AND TRIM(val) <> ''
+      AND (p_mode = 'all'
+        OR (p_mode = 'today' AND src.etl_processed_at::date = CURRENT_DATE)
+        OR (p_mode = 'date'  AND src.etl_processed_at::date = p_date))
 
     UNION ALL
 
-    -- soft_skills
     SELECT f.posting_id, r.require_id
     FROM  fact_jobs_etl src
     JOIN  fact_jobpostings f ON src.etl_id = f.etl_id
-    CROSS JOIN LATERAL
-          unnest(string_to_array(
-              regexp_replace(src.soft_skills, '\s*,\s*', ',', 'g'), ','
-          )) AS val
-    JOIN  dim_require r
-           ON r.require_type  = 'soft_skill'
-          AND r.require_value = TRIM(val)
-    WHERE src.soft_skills IS NOT NULL
-      AND src.is_duplicate = FALSE
-      AND TRIM(val) <> ''
-      AND (
-               p_mode = 'all'
-            OR (p_mode = 'today' AND src.etl_processed_at::date = CURRENT_DATE)
-            OR (p_mode = 'date'  AND src.etl_processed_at::date = p_date)
-          )
+    CROSS JOIN LATERAL unnest(string_to_array(
+        regexp_replace(src.soft_skills, '\s*,\s*', ',', 'g'), ',')) AS val
+    JOIN  dim_require r ON r.require_type = 'soft_skill' AND r.require_value = TRIM(val)
+    WHERE src.soft_skills IS NOT NULL AND src.is_duplicate = FALSE AND TRIM(val) <> ''
+      AND (p_mode = 'all'
+        OR (p_mode = 'today' AND src.etl_processed_at::date = CURRENT_DATE)
+        OR (p_mode = 'date'  AND src.etl_processed_at::date = p_date))
 
     UNION ALL
 
-    -- certifications
     SELECT f.posting_id, r.require_id
     FROM  fact_jobs_etl src
     JOIN  fact_jobpostings f ON src.etl_id = f.etl_id
-    CROSS JOIN LATERAL
-          unnest(string_to_array(
-              regexp_replace(src.certifications, '\s*,\s*', ',', 'g'), ','
-          )) AS val
-    JOIN  dim_require r
-           ON r.require_type  = 'certification'
-          AND r.require_value = TRIM(val)
-    WHERE src.certifications IS NOT NULL
-      AND src.is_duplicate = FALSE
-      AND TRIM(val) <> ''
-      AND (
-               p_mode = 'all'
-            OR (p_mode = 'today' AND src.etl_processed_at::date = CURRENT_DATE)
-            OR (p_mode = 'date'  AND src.etl_processed_at::date = p_date)
-          )
+    CROSS JOIN LATERAL unnest(string_to_array(
+        regexp_replace(src.certifications, '\s*,\s*', ',', 'g'), ',')) AS val
+    JOIN  dim_require r ON r.require_type = 'certification' AND r.require_value = TRIM(val)
+    WHERE src.certifications IS NOT NULL AND src.is_duplicate = FALSE AND TRIM(val) <> ''
+      AND (p_mode = 'all'
+        OR (p_mode = 'today' AND src.etl_processed_at::date = CURRENT_DATE)
+        OR (p_mode = 'date'  AND src.etl_processed_at::date = p_date))
 
     UNION ALL
 
-    -- languages
     SELECT f.posting_id, r.require_id
     FROM  fact_jobs_etl src
     JOIN  fact_jobpostings f ON src.etl_id = f.etl_id
-    CROSS JOIN LATERAL
-          unnest(string_to_array(
-              regexp_replace(src.languages, '\s*,\s*', ',', 'g'), ','
-          )) AS val
-    JOIN  dim_require r
-           ON r.require_type  = 'language'
-          AND r.require_value = TRIM(val)
-    WHERE src.languages IS NOT NULL
-      AND src.is_duplicate = FALSE
-      AND TRIM(val) <> ''
-      AND (
-               p_mode = 'all'
-            OR (p_mode = 'today' AND src.etl_processed_at::date = CURRENT_DATE)
-            OR (p_mode = 'date'  AND src.etl_processed_at::date = p_date)
-          )
+    CROSS JOIN LATERAL unnest(string_to_array(
+        regexp_replace(src.languages, '\s*,\s*', ',', 'g'), ',')) AS val
+    JOIN  dim_require r ON r.require_type = 'language' AND r.require_value = TRIM(val)
+    WHERE src.languages IS NOT NULL AND src.is_duplicate = FALSE AND TRIM(val) <> ''
+      AND (p_mode = 'all'
+        OR (p_mode = 'today' AND src.etl_processed_at::date = CURRENT_DATE)
+        OR (p_mode = 'date'  AND src.etl_processed_at::date = p_date))
 
     UNION ALL
 
-    -- major
     SELECT f.posting_id, r.require_id
     FROM  fact_jobs_etl src
     JOIN  fact_jobpostings f ON src.etl_id = f.etl_id
-    CROSS JOIN LATERAL
-          unnest(string_to_array(
-              regexp_replace(src.major, '\s*,\s*', ',', 'g'), ','
-          )) AS val
-    JOIN  dim_require r
-           ON r.require_type  = 'major'
-          AND r.require_value = TRIM(val)
-    WHERE src.major IS NOT NULL
-      AND src.is_duplicate = FALSE
-      AND TRIM(val) <> ''
-      AND (
-               p_mode = 'all'
-            OR (p_mode = 'today' AND src.etl_processed_at::date = CURRENT_DATE)
-            OR (p_mode = 'date'  AND src.etl_processed_at::date = p_date)
-          )
+    CROSS JOIN LATERAL unnest(string_to_array(
+        regexp_replace(src.major, '\s*,\s*', ',', 'g'), ',')) AS val
+    JOIN  dim_require r ON r.require_type = 'major' AND r.require_value = TRIM(val)
+    WHERE src.major IS NOT NULL AND src.is_duplicate = FALSE AND TRIM(val) <> ''
+      AND (p_mode = 'all'
+        OR (p_mode = 'today' AND src.etl_processed_at::date = CURRENT_DATE)
+        OR (p_mode = 'date'  AND src.etl_processed_at::date = p_date))
 
     ON CONFLICT (fact_id, require_id) DO NOTHING;
 
     -- =========================================================================
-    -- 11. VIEWS (recreate để chắc chắn luôn up-to-date)
+    -- 11. VIEWS
     -- =========================================================================
     EXECUTE 'CREATE OR REPLACE VIEW vw_jobpostings_unique AS
              SELECT * FROM fact_jobpostings WHERE is_duplicate = FALSE';
@@ -432,9 +334,6 @@ BEGIN
     EXECUTE 'CREATE OR REPLACE VIEW vw_jobpostings_all AS
              SELECT * FROM fact_jobpostings';
 
-    -- =========================================================================
-    -- Trả về status
-    -- =========================================================================
     RETURN 'ETL DW hoàn tất — mode=' || p_mode ||
            COALESCE(' date=' || p_date::text, '');
 
