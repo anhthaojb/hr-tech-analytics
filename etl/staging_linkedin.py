@@ -132,7 +132,7 @@ def main():
           AND job_description IS NOT NULL
           AND job_description != ''
         ORDER BY scraped_at DESC
-        LIMIT 100
+        LIMIT 50
     """)
 
     rows = cur.fetchall()

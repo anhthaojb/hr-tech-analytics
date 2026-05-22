@@ -1065,7 +1065,7 @@ class RecruitmentETL:
                 df = pd.read_sql(
                     f"SELECT * FROM {SRC_TABLE} "
                     f"WHERE is_valid = TRUE "
-                    f"AND LEFT(scraped_at, 10) = CURRENT_DATE::text",
+                    f"AND scraped_at::date = CURRENT_DATE",
                     conn
                 )
                 target_date = date.today()
@@ -1108,7 +1108,6 @@ class RecruitmentETL:
                 "education_level":  _s(r.get("education_level")),
                 "job_description":  _s(r.get("job_description")),
                 "job_requirement":  _s(r.get("job_requirement")),
-                "raw_about_job":    _s(r.get("raw_about_job")),
                 "job_posted_at":    _s(r.get("job_posted_at")),
                 "job_deadline":     _s(r.get("job_deadline")),
                 # is_valid từ PostgreSQL trả về bool, giữ nguyên
