@@ -23,7 +23,7 @@ chromedriver_autoinstaller.install(no_ssl=True)
 #  CONFIG
 # =========================================================
 
-MAX_JOBS_PER_KEYWORD = 10
+MAX_JOBS_PER_KEYWORD = 5
 
 KEYWORDS_BY_CATEGORY = {
     "software_dev": [
@@ -116,18 +116,6 @@ SEL_NEXT_PAGE = [
     (By.CSS_SELECTOR, "a.next_page"),
 ]
 
-# =========================================================
-#  KIỂM TRA NGÀY — dùng cho daily mode
-# =========================================================
-
-# def _is_old(posted_text: str) -> bool:
-#     if not posted_text:
-#         return False
-#     return bool(re.search(
-#         r"\d+\s+(?:day|week|month|year)s?\s+ago",
-#         posted_text,
-#         re.IGNORECASE,
-#     ))
 def _is_old(posted_text: str, max_days: int = 3) -> bool:
     m = re.search(r"(\d+)\s+(day|week|month|year)s?\s+ago", posted_text, re.IGNORECASE)
     if not m:

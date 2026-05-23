@@ -41,28 +41,28 @@ MIN_ABOUT_JOB_CHARS  = 200
 DAILY_MAX_AGE_DAYS   = 3
 
 KEYWORDS_BY_CATEGORY = {
-    "software_dev": [
-        "software engineer",
-        "backend developer",
-        "frontend developer",
-        "full stack developer",
-    ],
-    "data": [
-        "data analyst",
-        "data scientist",
-        "data engineer",
-        "business intelligence",
-    ],
-    "devops_cloud": [
-        "devops engineer",
-        "cloud engineer",
-        "site reliability engineer",
-    ],
-    "security": [
-        "cybersecurity",
-        "security engineer",
-        "penetration tester",
-    ],
+    # "software_dev": [
+    #     "software engineer",
+    #     "backend developer",
+    #     "frontend developer",
+    #     "full stack developer",
+    # ],
+    # "data": [
+    #     "data analyst",
+    #     "data scientist",
+    #     "data engineer",
+    #     "business intelligence",
+    # ],
+    # "devops_cloud": [
+    #     "devops engineer",
+    #     "cloud engineer",
+    #     "site reliability engineer",
+    # ],
+    # "security": [
+    #     "cybersecurity",
+    #     "security engineer",
+    #     "penetration tester",
+    # ],
     "ai_ml": [
         "machine learning engineer",
         "AI engineer",
