@@ -1,24 +1,15 @@
 """
 pipelines.py — Supabase (PostgreSQL) version
 =============================================
-THAY ĐỔI SO VỚI MySQL:
-  [1] mysql.connector  → psycopg2
-  [2] %s placeholders  → %s  (psycopg2 vẫn dùng %s — không đổi)
-  [3] ON DUPLICATE KEY UPDATE → ON CONFLICT (job_url) DO UPDATE SET
-  [4] lastrowid        → RETURNING id  (psycopg2 dùng cursor.fetchone())
-  [5] conn.ping()      → psycopg2 không có ping → dùng SELECT 1
-  [6] TINYINT(1) 0/1   → BOOLEAN True/False
-  [7] _CREATE_TABLE_SQL → bỏ (schema đã tạo qua 01_schema_supabase.sql)
-  [8] DDL AUTO_INCREMENT → SERIAL (đã trong schema)
-  [9] Xử lý is_valid   → True/False thay vì 1/0
 """
-
 from itemadapter import ItemAdapter
 import psycopg2
 import psycopg2.extras
 import re
 import os
 from datetime import datetime, timedelta
+
+from scrapy import item
 from etl.lookups import (
     VW_JOB_TYPE, VW_EDUCATION, VW_JOB_LEVEL, VW_COMPANY_SIZE,
     ITVIEC_WORK_MODE_MAP, ITVIEC_VALID_OUTPUTS, ITVIEC_WORK_MODE_INPUTS,
@@ -117,7 +108,6 @@ def clean_dict(raw: dict) -> dict:
         "experience", "job_type", "work_mode", "level", "job_url",
         "company_size", "company_industry", "number_recruit",
         "education_level", "job_posted_at", "job_deadline",
-        "raw_about_job",
     ]
     for field in STR_FIELDS:
         val = raw.get(field)
@@ -173,9 +163,6 @@ def clean_dict(raw: dict) -> dict:
         item["job_posted_at"]   = _clean_date(item["job_posted_at"])
         item["job_deadline"]    = _clean_date(item["job_deadline"])
     elif website == "linkedin":
-        if not item["job_description"]:
-            raw_desc = (raw.get("raw_about_job") or "").strip()
-            item["job_description"] = _clean_nbsp(raw_desc)
         posted = item["job_posted_at"]
         if _LI_TIME_PAT.search(posted):
             item["job_posted_at"] = _relative_to_date(posted, scraped_iso)
@@ -248,12 +235,12 @@ _INSERT_SQL = """
         experience, compensation, job_type, work_mode,
         level, job_url, company_size, company_industry,
         job_category, number_recruit, education_level,
-        job_description, job_requirement, raw_about_job,
+        job_description, job_requirement,
         job_posted_at, job_deadline, scraped_at,
         is_valid, error_log, ai_processed
     ) VALUES (
         %s,%s,%s,%s, %s,%s,%s,%s,
-        %s,%s,%s,%s, %s,%s,%s,%s,
+        %s,%s,%s,%s, %s,%s,%s,
         %s,%s, %s,%s,%s, %s,%s,%s
     )
     ON CONFLICT (job_url) DO UPDATE SET
@@ -320,6 +307,8 @@ def save_to_db(cur, conn, item: dict) -> tuple[bool, str]:
     try:
         # [THAY ĐỔI 4] psycopg2: dùng RETURNING để phân biệt INSERT vs UPDATE
         sql_returning = _INSERT_SQL + " RETURNING (xmax = 0) AS is_new_row"
+        print("DEBUG SQL TEMPLATE:", sql_returning)
+        print("DEBUG PARAMS TUPLE:", _insert_params(item))
         cur.execute(sql_returning, _insert_params(item))
         conn.commit()
 

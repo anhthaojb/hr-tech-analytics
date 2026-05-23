@@ -1,19 +1,19 @@
 # ==============================================================================
 # .github/workflows/daily_etl.yml
-# Thay thế hoàn toàn run.bat + Windows Task Scheduler
 #
-# LUỒNG CHẠY (giống run.bat):
-#   Step 1 — LinkedIn Selenium  ← BỎ QUA (cần GUI browser, không chạy được trên CI)
-#   Step 2 — Scrapy spiders     ← CHẠY (headless Playwright OK trên Ubuntu)
-#   Step 3 — ETL transform      ← CHẠY
-#   Step 4 — Load DW            ← CHẠY (tích hợp trong etl_supabase.py)
+# LUỒNG CHẠY:
+#   Step 1 — Scrapy spiders          (headless Playwright, bỏ qua LinkedIn Selenium)
+#   Step 2 — AI processor LinkedIn   (Groq LLM enrichment)
+#   Step 3 — ETL transform + save    (etl_supabase.py — KHÔNG dedup, KHÔNG load DW)
+#   Step 4 — Global Dedup            (dedup.py — quét toàn kho, gắn cờ is_duplicate)
+#   Step 5 — Load Data Warehouse     (dedup.py gọi sp_etl_load_dw, hoặc chạy riêng)
 #
-# SECRETS cần thêm vào GitHub repo → Settings → Secrets and variables → Actions:
+# SECRETS cần thêm vào GitHub → Settings → Secrets and variables → Actions:
 #   DATABASE_URL          postgresql+psycopg2://postgres:[PASS]@db.[REF].supabase.co:5432/postgres
 #   GROQ_API_KEY          gsk_...
-#   LINKEDIN_USERNAME     (dùng cho chạy local, không dùng trên CI)
-#   LINKEDIN_PASSWORD     (dùng cho chạy local, không dùng trên CI)
 #   SCRAPEOPS_API_KEY     53cd5666-...
+#   ITVIEC_EMAIL          (dùng cho spider itviec)
+#   ITVIEC_PASSWORD       (dùng cho spider itviec)
 # ==============================================================================
 
 name: Daily ETL Pipeline
@@ -23,7 +23,7 @@ on:
     # Chạy lúc 8:00 SA giờ Việt Nam (UTC+7) = 01:00 UTC
     - cron: "0 1 * * *"
 
-  # Cho phép chạy thủ công từ GitHub UI
+  # Chạy thủ công từ GitHub UI
   workflow_dispatch:
     inputs:
       mode:
@@ -47,7 +47,7 @@ jobs:
   etl:
     name: Run ETL Pipeline
     runs-on: ubuntu-latest
-    timeout-minutes: 120   # tối đa 2 tiếng
+    timeout-minutes: 120
 
     steps:
       # ------------------------------------------------------------------
@@ -74,50 +74,67 @@ jobs:
           pip install -r requirements.txt
 
       # ------------------------------------------------------------------
-      # 4. Install Playwright browsers (Chromium cho Scrapy-Playwright)
+      # 4. Install Playwright browsers
       # ------------------------------------------------------------------
       - name: Install Playwright Chromium
         run: |
           playwright install chromium --with-deps
 
       # ------------------------------------------------------------------
-      # 5. Chạy Scrapy spiders
-      #    - Các spider dùng Playwright/HTTP đều chạy được trên Ubuntu
-      #    - linkedin_selenium.py KHÔNG chạy ở đây (cần undetected-chromedriver + GUI)
+      # 5. [Spider] Scrapy spiders — LinkedIn Selenium BỎ QUA (cần GUI)
       # ------------------------------------------------------------------
       - name: Run Scrapy spiders
         env:
-          ITVIEC_EMAIL:    ${{ secrets.ITVIEC_EMAIL }}      # ← thêm
-          ITVIEC_PASSWORD: ${{ secrets.ITVIEC_PASSWORD }}   # ← thêm
+          ITVIEC_EMAIL:    ${{ secrets.ITVIEC_EMAIL }}
+          ITVIEC_PASSWORD: ${{ secrets.ITVIEC_PASSWORD }}
         run: |
           echo "=========================================="
-          echo " [2/3] Scrapy spiders | mode=$MODE"
+          echo " [1/4] Scrapy spiders | mode=$MODE"
           echo "=========================================="
           python run_spiders.py $MODE
         continue-on-error: true   # spider lỗi không block ETL
-      - name: Run AI processor (LinkedIn)
-        env:
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python etl/staging_linkedin.py
-
 
       # ------------------------------------------------------------------
-      # 6. Chạy ETL (transform + dedup + load DW)
+      # 6. [AI] Enrichment LinkedIn bằng Groq LLM
       # ------------------------------------------------------------------
-      - name: Run ETL
+      - name: Run AI processor (LinkedIn staging)
         run: |
           echo "=========================================="
-          echo " [3/3] ETL transform + Load DW | mode=$MODE"
+          echo " [2/4] AI processor LinkedIn"
+          echo "=========================================="
+          python etl/staging_linkedin.py
+
+      # ------------------------------------------------------------------
+      # 7. [ETL] Transform + Save fact — KHÔNG dedup, KHÔNG load DW
+      #    ETL chỉ tập trung: load raw → transform → save fact_jobs_etl
+      # ------------------------------------------------------------------
+      - name: Run ETL (transform + save fact)
+        run: |
+          echo "=========================================="
+          echo " [3/4] ETL transform + Save | mode=$MODE"
           echo "=========================================="
           if [ "$MODE" = "full" ]; then
             python etl/etl_supabase.py --all
           else
             python etl/etl_supabase.py
           fi
+
       # ------------------------------------------------------------------
-      # 7. Notify on failure (optional — xóa nếu không dùng)
+      # 8. [Dedup] Quét trùng lặp TOÀN KHO + Load Data Warehouse
+      #    - Reset toàn bộ is_duplicate cũ
+      #    - Exact match + Fuzzy match trên 100% fact_jobs_etl
+      #    - Gắn cờ is_duplicate / duplicate_of_id / dedup_method
+      #    - Gọi sp_etl_load_dw('all', NULL) để đồng bộ DW
+      # ------------------------------------------------------------------
+      - name: Run Global Dedup + Load DW
+        run: |
+          echo "=========================================="
+          echo " [4/4] Global Dedup + Load Data Warehouse"
+          echo "=========================================="
+          python etl/dedup.py
+
+      # ------------------------------------------------------------------
+      # 9. Notify on failure
       # ------------------------------------------------------------------
       - name: Notify on failure
         if: failure()

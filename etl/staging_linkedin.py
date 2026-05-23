@@ -17,34 +17,32 @@ from jobscrapers.pipelines import get_db_connection, _clean_nbsp
 logger = logging.getLogger(__name__)
 
 # ===== GROQ CONFIG =====
-MODEL           = "llama-3.1-8b-instant"
+MODEL = "llama-3.3-70b-versatile"
 MAX_RETRIES     = 3
 RETRY_DELAY     = 2
 MAX_RAW_CHARS   = 6000
 MAX_REQ_PER_MIN = 28
 
 SYSTEM_PROMPT = """
-You are a job data extraction assistant. Given raw text from a LinkedIn job posting
-(may be in English, Vietnamese, or mixed), extract and return ONLY a valid JSON object.
-Use empty string "" if information is not present.
+You are an expert data extraction assistant specialized in tech job postings.
+Your sole task is to parse the provided raw job text and organize it into a structured JSON object.
 
+Input text contains both what the candidate will do and what qualifications they need. Separate them cleanly.
+
+Return ONLY a valid JSON with this exact schema:
 {
-  "job_description" : "ONLY the responsibilities/duties section (Mô tả công việc / Trách nhiệm). What the candidate will DO. Plain text, no bullet symbols. Separate sentences with newline.",
-  "job_requirement" : "ONLY the requirements/qualifications section (Yêu cầu / Kỹ năng). What the candidate MUST HAVE. Include preferred qualifications. Plain text, no bullet symbols. Separate sentences with newline.",
-  "compensation"    : "Salary if explicitly mentioned. Keep original format and unit. Examples: '1.47-23 USD/task', '20-30 triệu/tháng', '100000-120000 USD/year', '25-35 USD/hour', '15-20 triệu VND/tháng'. Empty if not found.",
-  "salary_type"     : "One of: hourly / monthly / yearly / per_task / negotiable. Vietnamese hints: 'triệu/tháng' → monthly, 'nghìn/giờ' → hourly, 'thỏa thuận' or 'thoả thuận' → negotiable, 'theo dự án' or 'per task' → per_task. Empty if unclear.",
-  "level"           : "Seniority level. English: Intern / Fresher / Junior / Mid / Senior / Manager / Director. Vietnamese hints: 'thực tập' → Intern, 'mới ra trường' → Fresher, 'có kinh nghiệm' → Junior or above. Empty if unclear.",
-  "job_type"        : "Employment type: Full-time / Part-time / Contract / Freelance. Vietnamese: 'toàn thời gian' → Full-time, 'bán thời gian' → Part-time, 'hợp đồng' → Contract, 'cộng tác viên' → Freelance. 'Contractor' → Contract. Empty if not mentioned.",
-  "work_mode"       : "Work arrangement: On-site / Remote / Hybrid. Vietnamese: 'tại văn phòng' → On-site, 'làm từ xa' or 'làm việc từ nhà' → Remote, 'kết hợp' → Hybrid. Empty if not mentioned.",
-  "education_level" : "Minimum education. Examples: 'Bachelor', 'Master', 'Cao đẳng', 'Đại học', 'Thạc sĩ'. Empty if not mentioned.",
-  "experience"      : "Required years. Examples: '2+ years', '3-5 years', '6 months', '2 năm kinh nghiệm', '6 tháng'. For intern or no experience: '0'. Empty if not mentioned."
+  "job_description": "Responsibilities, core duties, and daily tasks. Plain text, remove all bullet points, separate sentences with newlines.",
+  "job_requirement": "Requirements, skills, tech stack, experience, and education needed. Plain text, remove all bullet points, separate sentences with newlines.",
+  "compensation": "Salary info if found (e.g., 'Thỏa thuận', '20-30 triệu/tháng', '1000 USD/month').",
+  "salary_type": "hourly, monthly, yearly, per_task, or negotiable.",
+  "level": "Intern, Fresher, Junior, Mid, Senior, Manager, or Director.",
+  "job_type": "Full-time, Part-time, Contract, or Freelance.",
+  "work_mode": "On-site, Remote, or Hybrid.",
+  "education_level": "Minimum degree required if mentioned.",
+  "experience": "Years of experience needed (e.g., '2+ years', '0' for intern)."
 }
 
-CRITICAL RULES:
-1. Return ONLY raw JSON. No markdown fences, no explanation, no preamble.
-2. job_description = responsibilities/duties/what you will do / mô tả công việc / trách nhiệm ONLY. Do NOT include requirements.
-3. job_requirement = requirements/qualifications / yêu cầu / kỹ năng / bằng cấp ONLY. Include preferred qualifications / ưu tiên. Do NOT include duties.
-4. If sections are mixed, use section headers or context clues to separate them.
+CRITICAL: Do not write any markdown fences (like ```json), no explanations, no chat preamble. Just raw JSON. If any information is missing, use empty string "".
 5. Do not invent information not present in the source.
 6. Keep Vietnamese text in Vietnamese. Keep English text in English. Do NOT translate.
 7. Remove ALL bullet symbols (-, •, *, ▪, ·, –) — plain sentences separated by newlines only.
@@ -52,6 +50,7 @@ CRITICAL RULES:
 9. salary_type: /hour or per hour or /giờ → hourly; /month or /tháng → monthly; /year or /năm → yearly; per task or theo dự án → per_task; thỏa thuận or negotiable or competitive → negotiable.
 10. job_type: Never use 'Internship' as job_type — use level field for intern detection instead.
 """.strip()
+
 client    = Groq(api_key=os.getenv("GROQ_API_KEY"))
 _req_count  = 0
 _req_window = time.time()
@@ -132,8 +131,9 @@ def main():
           AND job_description IS NOT NULL
           AND job_description != ''
         ORDER BY scraped_at DESC
-        LIMIT 50
+        LIMIT 100
     """)
+
 
     rows = cur.fetchall()
     cols = [d[0] for d in cur.description]
@@ -144,7 +144,8 @@ def main():
     for i, item in enumerate(items, 1):
         print(f"  [{i}/{len(items)}] {item['job_title']}")
         try:
-            ai = _call_groq(item["job_description"])
+            full_raw_text = item["job_description"]
+            ai = _call_groq(full_raw_text)
 
             def _clean_field(field):
                 ai_val = (ai.get(field) or "").strip()
@@ -154,11 +155,11 @@ def main():
 
 
             job_desc = (ai.get("job_description") or "").strip()
+            job_req = (ai.get("job_requirement") or "").strip()
+            if not job_req:
+                job_req = "Thông tin chi tiết xem tại mô tả công việc hoặc liên hệ nhà tuyển dụng."
             if not job_desc:
                 job_desc = (item.get("job_description") or "").strip()
-
-            job_req = (ai.get("job_requirement") or "").strip()
-
             # Chuẩn hóa lương mặc định
             compensation_val = _clean_field("compensation")
             if not compensation_val or compensation_val.lower() in ["", "none", "null"]:

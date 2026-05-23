@@ -1057,7 +1057,7 @@ class RecruitmentETL:
                 df = pd.read_sql(
                     f"SELECT * FROM {SRC_TABLE} "
                     f"WHERE is_valid = TRUE "
-                    f"AND scraped_at::date = CURRENT_DATE;",
+                    f"AND scraped_at::date = '{date_str}'",
                     conn, params={"dt": date_str}
                 )
                 target_date = date_str
@@ -1268,8 +1268,8 @@ class RecruitmentETL:
 
         total_chunks = 0
         with self.engine.begin() as conn:
-            for i in range(0, len(df), 100):
-                chunk = df.iloc[i:i+100]
+            for i in range(0, len(df), 20):
+                chunk = df.iloc[i:i+20]
                 cols  = list(chunk.columns)
                 placeholders = ", ".join([f":{c}" for c in cols])
                 col_list     = ", ".join(cols)
@@ -1287,6 +1287,7 @@ class RecruitmentETL:
                 rows = [_clean_row(r) for r in chunk.to_dict("records")]
                 conn.execute(sqlalchemy.text(sql), rows)
                 total_chunks += len(chunk)
+                time.sleep(0.2)
 
         print(f"   ✅ UPSERT {total_chunks:,} rows.")
         return {"new": total_chunks, "updated": 0}
@@ -1391,16 +1392,15 @@ class RecruitmentETL:
 
     def _dedup_and_flag(self, run_id: int) -> dict:
         """
-        [THAY ĐỔI 7]
-        MySQL : is_valid=1, SET is_duplicate=0/1
-        PgSQL : is_valid=TRUE, SET is_duplicate=FALSE/TRUE
+        [ĐÃ TỐI ƯU] Đối chiếu tổng kho: Chỉ đánh trùng dựa trên bộ 3: 
+        Tên Công Ty + Tiêu Đề Job + Tỉnh Thành.
         """
         from rapidfuzz import fuzz as _rfuzz
-        SOURCE_PRIORITY = {"itviec": 0, "linkedin": 1, "topcv": 2,
-                           "vietnamworks": 3, "careerbuilder": 4}
+        SOURCE_PRIORITY = {"itviec": 0, "linkedin": 1, "topcv": 2, "vietnamworks": 3}
         FUZZY_THRESHOLD = 85
-        print(f"\n⏳ [3.8/5] Dedup & flag (run_id={run_id})...")
+        print(f"\n⏳ [3.8/5] Dedup toàn bộ kho dữ liệu (Theo Job + Cty + Địa điểm, run_id={run_id})...")
 
+        # 1. Reset trạng thái trùng lặp cho riêng các bản ghi mới nạp thuộc lượt chạy này
         with self.engine.begin() as conn:
             conn.execute(sqlalchemy.text(f"""
                 UPDATE {FACT_TABLE}
@@ -1410,64 +1410,75 @@ class RecruitmentETL:
                 WHERE  etl_run_id = :rid
             """), {"rid": run_id})
 
+        # 2. SELECT tối giản (Bỏ sạch các trường text nặng như job_description, hard_skills)
         with self.engine.connect() as conn:
             df = pd.read_sql(f"""
-                SELECT etl_id, website_clean, company_name_clean,
-                       job_title_detect, job_title_clean,
-                       location_province, salary_min, salary_max,
-                       hard_skills, job_description
+                SELECT etl_id, etl_run_id, website_clean, company_name_clean,
+                       job_title_detect, job_title_clean, location_province,
+                       salary_min, salary_max
                 FROM {FACT_TABLE}
-                WHERE etl_run_id = {run_id} AND is_valid = TRUE
+                WHERE is_valid = TRUE
             """, conn)
 
         if df.empty:
-            print("   Không có row nào cần dedup.")
+            print("   Không có dữ liệu lịch sử để thực hiện đối chiếu dedup.")
             return {"flagged": 0, "exact": 0, "fuzzy": 0}
 
+        # 3. Chuẩn hóa dữ liệu phục vụ nhóm và so khớp
         df["_co"]       = df["company_name_clean"].fillna("unknown").str.lower().str.strip()
         df["_prov"]     = df["location_province"].fillna("Khác")
         df["_src_rank"] = df["website_clean"].map(lambda x: SOURCE_PRIORITY.get(str(x).lower(), 99))
-        df["_info"]     = (
-            df["salary_min"].notna().astype(int) * 2
-            + df["salary_max"].notna().astype(int)
-            + df["hard_skills"].notna().astype(int)
-            + df["job_description"].fillna("").str.len().clip(0, 1)
-        )
+        
+        # Tiêu chí phụ để xếp hạng: Dòng nào có điền lương rõ ràng sẽ được ưu tiên giữ lại làm gốc (Canon)
+        df["_info"]     = df["salary_min"].notna().astype(int) + df["salary_max"].notna().astype(int)
+        
         df["_tdk"] = df.apply(
             lambda r: _title_dedup_key(r["job_title_detect"], r["job_title_clean"] or ""), axis=1)
 
         dup_records: list[dict] = []
+        current_run_etl_ids = set(df[df["etl_run_id"] == run_id]["etl_id"])
 
+        # --- THUẬT TOÁN 1: EXACT DEDUP (Áp dụng cho các Job đã detect được chuẩn hóa) ---
         df_det = df[df["job_title_detect"].notna()].copy()
         df_det["_key"] = df_det["_co"] + "||" + df_det["_tdk"] + "||" + df_det["_prov"]
+        
         for _, grp in df_det.groupby("_key", sort=False):
             if len(grp) == 1:
                 continue
-            grp      = grp.sort_values(["_src_rank", "_info"], ascending=[True, False])
+            # Sắp xếp: Ưu tiên giữ lại bản ghi cũ trong quá khứ (etl_id nhỏ), nguồn xịn, thông tin lương đủ
+            grp = grp.sort_values(["etl_id", "_src_rank", "_info"], ascending=[True, True, False])
             canon_id = int(grp.iloc[0]["etl_id"])
+            
             for _, dup in grp.iloc[1:].iterrows():
-                dup_records.append({"dup_id": int(dup["etl_id"]),
-                                    "canon_id": canon_id, "method": "exact"})
+                dup_id = int(dup["etl_id"])
+                # Chỉ xử lý gắn cờ nếu bản ghi bị trùng thuộc lượt chạy (batch) ngày hôm nay
+                if dup_id in current_run_etl_ids and dup_id != canon_id:
+                    dup_records.append({"dup_id": dup_id, "canon_id": canon_id, "method": "exact"})
 
+        # --- THUẬT TOÁN 2: FUZZY DEDUP (Áp dụng cho Job chưa detect, so khớp chuỗi tiêu đề giống >= 85%) ---
         df_nod = df[df["job_title_detect"].isna()].copy()
         for (co, prov), grp in df_nod.groupby(["_co", "_prov"], sort=False):
             if len(grp) == 1:
                 continue
-            grp    = grp.sort_values(["_src_rank", "_info"], ascending=[True, False])
+            grp    = grp.sort_values(["etl_id", "_src_rank", "_info"], ascending=[True, True, False])
             titles = grp["job_title_clean"].fillna("").str.lower().tolist()
             ids    = grp["etl_id"].tolist()
             is_dup = [False] * len(grp)
+            
             for i in range(len(titles)):
                 if is_dup[i]:
                     continue
                 for j in range(i + 1, len(titles)):
                     if is_dup[j]:
                         continue
+                    # Tính tỷ lệ tương đồng giữa 2 tiêu đề job thô
                     if _rfuzz.token_sort_ratio(titles[i], titles[j]) >= FUZZY_THRESHOLD:
                         is_dup[j] = True
-                        dup_records.append({"dup_id": int(ids[j]),
-                                            "canon_id": int(ids[i]), "method": "fuzzy"})
+                        dup_id = int(ids[j])
+                        if dup_id in current_run_etl_ids and dup_id != int(ids[i]):
+                            dup_records.append({"dup_id": dup_id, "canon_id": int(ids[i]), "method": "fuzzy"})
 
+        # 4. Thực hiện cập nhật hàng loạt xuống Supabase bằng kỹ thuật chunking (mỗi lượt 500 dòng)
         if dup_records:
             with self.engine.begin() as conn:
                 for i in range(0, len(dup_records), 500):
@@ -1482,9 +1493,9 @@ class RecruitmentETL:
 
         n_exact = sum(1 for r in dup_records if r["method"] == "exact")
         n_fuzzy = sum(1 for r in dup_records if r["method"] == "fuzzy")
-        print(f"   Flag: {len(dup_records):,} dups ({n_exact} exact | {n_fuzzy} fuzzy) / {len(df):,} rows")
+        print(f"   📊 [Xong] Quét trùng hoàn tất! Gắn cờ {len(dup_records):,} jobs trùng lặp mới "
+              f"({n_exact} exact | {n_fuzzy} fuzzy) trên tổng số {len(current_run_etl_ids):,} dòng mới.")
         return {"flagged": len(dup_records), "exact": n_exact, "fuzzy": n_fuzzy}
-
     # --------------------------------------------------------------------------
     # LOAD DWH  [THAY ĐỔI 8]
     # --------------------------------------------------------------------------
@@ -1534,17 +1545,13 @@ class RecruitmentETL:
     
                 print("\n⏳ [3.5/5] Match company...")
                 self._match_and_update_companies(run_id)
-    
-                print("\n⏳ [3.8/5] Dedup & flag...")
-                dedup           = self._dedup_and_flag(run_id)
-                counts["dupes"] = dedup["flagged"]
-    
+
                 print("\n⏳ [4/5] Save errors...")
                 self._save_errors(ec, run_id)
-    
-                print("\n⏳ [5/5] Load Data Warehouse...")
-                self._load_dwh(mode, date_str)
-    
+
+                # NOTE: Dedup toàn kho và Load DW được tách ra chạy riêng sau ETL
+                # bằng file dedup.py (xem daily_etl.yml để biết thứ tự chạy)
+
                 if counts["input"] > 0 and counts["errors"] / counts["input"] > 0.2:
                     status = "WARN"
     
